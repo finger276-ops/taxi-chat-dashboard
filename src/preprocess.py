@@ -824,51 +824,71 @@ def make_events(
     return events, event_discussions
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Path to source CSV")
-    parser.add_argument("--output", default="data/processed", help="Output directory")
-    parser.add_argument("--window-minutes", type=int, default=60)
-    parser.add_argument("--cluster-method", choices=["tfidf", "embeddings", "none"], default="tfidf")
-    parser.add_argument("--similarity-threshold", type=float, default=0.28)
-    parser.add_argument("--event-gap-hours", type=float, default=3.0, help="Split clusters into separate events when the time gap is larger than this value")
-    parser.add_argument("--event-window-hours", type=float, default=16.0, help="Additionally limit one event to a fixed time span")
-    parser.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    args = parser.parse_args()
 
-    output = Path(args.output)
+def clear_processed_tables(output: Path) -> None:
+    """Remove stale generated tables before writing a new dataset."""
     output.mkdir(parents=True, exist_ok=True)
+    for name in [
+        "messages",
+        "message_tags",
+        "discussions",
+        "discussion_messages",
+        "events",
+        "event_discussions",
+    ]:
+        for ext in ["csv", "parquet"]:
+            path = output / f"{name}.{ext}"
+            if path.exists():
+                path.unlink()
+    manifest = output / "manifest.json"
+    if manifest.exists():
+        manifest.unlink()
 
-    raw = read_source_csv(args.input)
+
+def build_processed_tables(
+    raw: pd.DataFrame,
+    output: str | Path = "data/processed",
+    source_file: str = "uploaded_csv",
+    window_minutes: int = 60,
+    cluster_method: str = "tfidf",
+    similarity_threshold: float = 0.28,
+    event_gap_hours: float = 3.0,
+    event_window_hours: float = 16.0,
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+) -> dict:
+    """Build all generated dashboard tables from a raw dataframe and return manifest."""
+    output = Path(output)
+    clear_processed_tables(output)
+
     tag_cols = detect_tag_columns(raw)
 
     messages, message_tags = normalize_messages(raw, tag_cols)
-    discussions, discussion_messages = make_discussions(messages, window_minutes=args.window_minutes)
+    discussions, discussion_messages = make_discussions(messages, window_minutes=window_minutes)
 
     # Filter empty discussions from clustering, but preserve them as singleton events.
     clusterable = discussions[discussions["discussion_text"].fillna("").str.len() > 10].copy()
     non_clusterable = discussions.drop(clusterable.index).copy()
 
-    if args.cluster_method == "none":
+    if cluster_method == "none":
         labels = pd.Series(range(len(clusterable)), index=clusterable.index)
-    elif args.cluster_method == "embeddings":
+    elif cluster_method == "embeddings":
         labels = cluster_discussions_embeddings(
             clusterable,
-            similarity_threshold=args.similarity_threshold,
-            model_name=args.embedding_model,
+            similarity_threshold=similarity_threshold,
+            model_name=embedding_model,
         )
     else:
         labels = cluster_discussions_tfidf(
             clusterable,
-            similarity_threshold=args.similarity_threshold,
-            max_gap_hours=args.event_gap_hours,
-            max_event_span_hours=args.event_window_hours,
+            similarity_threshold=similarity_threshold,
+            max_gap_hours=event_gap_hours,
+            max_event_span_hours=event_window_hours,
         )
 
     if len(clusterable):
         labels = refine_labels_by_tag(labels, clusterable)
-        labels = split_labels_by_time_gap(labels, clusterable, max_gap_hours=args.event_gap_hours)
-        labels = split_labels_by_fixed_time_window(labels, clusterable, window_hours=args.event_window_hours)
+        labels = split_labels_by_time_gap(labels, clusterable, max_gap_hours=event_gap_hours)
+        labels = split_labels_by_fixed_time_window(labels, clusterable, window_hours=event_window_hours)
 
     if len(non_clusterable):
         start_label = int(labels.max()) + 1 if len(labels) else 0
@@ -891,20 +911,96 @@ def main() -> None:
     }
 
     manifest = {
-        "source_file": str(Path(args.input).resolve()),
+        "source_file": source_file,
         "rows_source": int(len(raw)),
         "rows_messages": int(len(messages)),
         "rows_discussions": int(len(discussions)),
         "rows_events": int(len(events)),
         "tag_columns": tag_cols,
-        "window_minutes": args.window_minutes,
-        "cluster_method": args.cluster_method,
-        "similarity_threshold": args.similarity_threshold,
-        "event_gap_hours": args.event_gap_hours,
-        "event_window_hours": args.event_window_hours,
+        "window_minutes": window_minutes,
+        "cluster_method": cluster_method,
+        "similarity_threshold": similarity_threshold,
+        "event_gap_hours": event_gap_hours,
+        "event_window_hours": event_window_hours,
         "paths": paths,
     }
     write_manifest(output, manifest)
+    return manifest
+
+
+def run_preprocess(
+    input_path: str | Path,
+    output: str | Path = "data/processed",
+    window_minutes: int = 60,
+    cluster_method: str = "tfidf",
+    similarity_threshold: float = 0.28,
+    event_gap_hours: float = 3.0,
+    event_window_hours: float = 16.0,
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+) -> dict:
+    """Read a source CSV, generate tables and return manifest. Usable from Streamlit."""
+    input_path = Path(input_path)
+    raw = read_source_csv(input_path)
+    return build_processed_tables(
+        raw=raw,
+        output=output,
+        source_file=str(input_path.resolve()),
+        window_minutes=window_minutes,
+        cluster_method=cluster_method,
+        similarity_threshold=similarity_threshold,
+        event_gap_hours=event_gap_hours,
+        event_window_hours=event_window_hours,
+        embedding_model=embedding_model,
+    )
+
+
+def run_preprocess_from_dataframe(
+    raw: pd.DataFrame,
+    output: str | Path = "data/processed",
+    source_file: str = "uploaded_csv",
+    window_minutes: int = 60,
+    cluster_method: str = "tfidf",
+    similarity_threshold: float = 0.28,
+    event_gap_hours: float = 3.0,
+    event_window_hours: float = 16.0,
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+) -> dict:
+    """Generate tables from an already loaded dataframe. Usable for combining uploads."""
+    return build_processed_tables(
+        raw=raw,
+        output=output,
+        source_file=source_file,
+        window_minutes=window_minutes,
+        cluster_method=cluster_method,
+        similarity_threshold=similarity_threshold,
+        event_gap_hours=event_gap_hours,
+        event_window_hours=event_window_hours,
+        embedding_model=embedding_model,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to source CSV")
+    parser.add_argument("--output", default="data/processed", help="Output directory")
+    parser.add_argument("--window-minutes", type=int, default=60)
+    parser.add_argument("--cluster-method", choices=["tfidf", "embeddings", "none"], default="tfidf")
+    parser.add_argument("--similarity-threshold", type=float, default=0.28)
+    parser.add_argument("--event-gap-hours", type=float, default=3.0, help="Split clusters into separate events when the time gap is larger than this value")
+    parser.add_argument("--event-window-hours", type=float, default=16.0, help="Additionally limit one event to a fixed time span")
+    parser.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    args = parser.parse_args()
+
+    manifest = run_preprocess(
+        input_path=args.input,
+        output=args.output,
+        window_minutes=args.window_minutes,
+        cluster_method=args.cluster_method,
+        similarity_threshold=args.similarity_threshold,
+        event_gap_hours=args.event_gap_hours,
+        event_window_hours=args.event_window_hours,
+        embedding_model=args.embedding_model,
+    )
 
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 

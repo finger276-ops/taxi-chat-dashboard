@@ -10,13 +10,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from io_utils import read_table
+from io_utils import read_table, read_source_csv
 from manual_db import (
     connect,
     get_event_overrides,
@@ -31,12 +32,14 @@ from manual_db import (
     restore_message_relevance,
 )
 from settings import STATUS_OPTIONS
+from preprocess import run_preprocess, run_preprocess_from_dataframe
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", default=os.getenv("DASHBOARD_DATA_DIR", "data/processed"))
     parser.add_argument("--db-path", default=os.getenv("DASHBOARD_DB_PATH", "data/manual_actions.sqlite"))
+    parser.add_argument("--upload-dir", default=os.getenv("DASHBOARD_UPLOAD_DIR", "data/uploads"))
     args, _ = parser.parse_known_args()
     return args
 
@@ -844,6 +847,148 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
     )
 
 
+
+def safe_upload_name(filename: str) -> str:
+    name = Path(filename or "uploaded.csv").name
+    name = re.sub(r"[^0-9A-Za-zА-Яа-я_. -]+", "_", name)
+    if not name.lower().endswith(".csv"):
+        name += ".csv"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{stamp}_{name}"
+
+
+def read_manifest(data_dir: Path) -> dict:
+    path = data_dir / "manifest.json"
+    if not path.exists():
+        return {}
+    try:
+        import json
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def show_upload_page(data_dir: Path, upload_dir: Path):
+    st.subheader("Загрузка CSV нового периода")
+    st.write(
+        "Загрузите новый CSV-файл из Brand Analytics / Telegram-чатов. "
+        "Дашборд пересоберет сообщения, обсуждения и инфоповоды прямо из интерфейса."
+    )
+
+    st.warning(
+        "На Streamlit Cloud загруженные файлы и пересчитанные таблицы сохраняются в текущем runtime. "
+        "После redeploy или перезапуска окружения они могут сброситься к версии из GitHub. "
+        "Для постоянного обновления данных после проверки скачайте/закоммитьте обработанные файлы или храните данные во внешней БД."
+    )
+
+    manifest = read_manifest(data_dir)
+    if manifest:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Текущих сообщений", f"{int(manifest.get('rows_messages', 0)):,}".replace(",", " "))
+        c2.metric("Текущих обсуждений", f"{int(manifest.get('rows_discussions', 0)):,}".replace(",", " "))
+        c3.metric("Текущих инфоповодов", f"{int(manifest.get('rows_events', 0)):,}".replace(",", " "))
+
+    mode = st.radio(
+        "Режим загрузки",
+        [
+            "Заменить текущую выборку новым CSV",
+            "Добавить CSV в историю загрузок и пересобрать все загруженные периоды",
+        ],
+        help=(
+            "В режиме добавления дашборд объединит все CSV из папки data/uploads. "
+            "Если исходный CSV старого периода не был загружен в историю, он не попадет в пересборку."
+        ),
+    )
+
+    uploaded = st.file_uploader("CSV-файл нового периода", type=["csv"])
+
+    with st.expander("Параметры алгоритма", expanded=False):
+        col1, col2 = st.columns(2)
+        window_minutes = col1.number_input("Окно обсуждения, минут", min_value=10, max_value=240, value=60, step=5)
+        similarity_threshold = col2.slider("Порог похожести", min_value=0.10, max_value=0.60, value=0.28, step=0.01)
+        event_gap_hours = col1.number_input("Разрыв между волнами, часов", min_value=0.5, max_value=24.0, value=3.0, step=0.5)
+        event_window_hours = col2.number_input("Максимальная длина волны, часов", min_value=2.0, max_value=72.0, value=16.0, step=2.0)
+        cluster_method = st.selectbox("Метод кластеризации", ["tfidf", "none"], index=0)
+
+    col_a, col_b = st.columns([1, 2])
+    run = col_a.button("Загрузить и пересобрать", type="primary", disabled=uploaded is None)
+
+    if run and uploaded is not None:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_path = upload_dir / safe_upload_name(uploaded.name)
+        saved_path.write_bytes(uploaded.getbuffer())
+
+        try:
+            with st.spinner("Читаю CSV и пересобираю инфоповоды…"):
+                if mode.startswith("Заменить"):
+                    manifest = run_preprocess(
+                        input_path=saved_path,
+                        output=data_dir,
+                        window_minutes=int(window_minutes),
+                        cluster_method=cluster_method,
+                        similarity_threshold=float(similarity_threshold),
+                        event_gap_hours=float(event_gap_hours),
+                        event_window_hours=float(event_window_hours),
+                    )
+                else:
+                    csv_paths = sorted(upload_dir.glob("*.csv"))
+                    raw_parts = []
+                    used_files = []
+                    for path in csv_paths:
+                        try:
+                            raw_parts.append(read_source_csv(path))
+                            used_files.append(path.name)
+                        except Exception as e:
+                            st.warning(f"Файл {path.name} пропущен: {e}")
+                    if not raw_parts:
+                        st.error("Не удалось прочитать ни один CSV-файл.")
+                        return
+                    combined = pd.concat(raw_parts, ignore_index=True)
+                    manifest = run_preprocess_from_dataframe(
+                        raw=combined,
+                        output=data_dir,
+                        source_file="; ".join(used_files),
+                        window_minutes=int(window_minutes),
+                        cluster_method=cluster_method,
+                        similarity_threshold=float(similarity_threshold),
+                        event_gap_hours=float(event_gap_hours),
+                        event_window_hours=float(event_window_hours),
+                    )
+
+            st.cache_data.clear()
+            st.success(
+                "Данные пересобраны: "
+                f"{manifest.get('rows_messages', 0)} сообщений, "
+                f"{manifest.get('rows_discussions', 0)} обсуждений, "
+                f"{manifest.get('rows_events', 0)} инфоповодов."
+            )
+            st.info("Перейдите в раздел «Инфоповоды» или обновите страницу, чтобы увидеть новую выборку.")
+            if st.button("Открыть обновленные инфоповоды"):
+                st.rerun()
+        except Exception as e:
+            st.error("Не удалось обработать CSV.")
+            st.exception(e)
+
+    with st.expander("История загруженных CSV", expanded=False):
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(upload_dir.glob("*.csv"), reverse=True)
+        if not files:
+            st.write("Пока нет загруженных CSV-файлов.")
+        else:
+            history = pd.DataFrame({
+                "Файл": [f.name for f in files],
+                "Размер, КБ": [round(f.stat().st_size / 1024, 1) for f in files],
+                "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
+            })
+            st.dataframe(history, use_container_width=True, hide_index=True)
+            if st.button("Очистить историю загруженных CSV"):
+                for f in files:
+                    f.unlink(missing_ok=True)
+                st.success("История загрузок очищена.")
+                st.rerun()
+
 def main():
     args = parse_args()
 
@@ -854,13 +999,21 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.9: описания сформулированы тезисно и доступны для ручной корректировки")
+    st.caption("Версия 1.0: добавлена загрузка CSV нового периода прямо из дашборда")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
+    upload_dir = Path(args.upload_dir)
+
+    page = st.sidebar.radio("Раздел", ["Инфоповоды", "Поиск сообщений", "Загрузка CSV"], label_visibility="collapsed")
+
+    if page == "Загрузка CSV":
+        show_upload_page(data_dir, upload_dir)
+        return
 
     if not data_dir.exists():
         st.error(f"Папка с обработанными данными не найдена: {data_dir}")
+        st.info("Откройте раздел «Загрузка CSV» и загрузите исходный файл для первой сборки дашборда.")
         st.stop()
 
     conn = connect(db_path)
@@ -881,8 +1034,6 @@ def main():
         msg_overrides,
         msg_exclusions,
     )
-
-    page = st.sidebar.radio("Раздел", ["Инфоповоды", "Поиск сообщений"], label_visibility="collapsed")
 
     if page == "Поиск сообщений":
         show_message_search(enriched_messages, events, conn)
