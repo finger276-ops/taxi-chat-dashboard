@@ -1,8 +1,8 @@
 """
 Streamlit dashboard for taxi chat information events.
 
-Run:
-    streamlit run src/app.py -- --data-dir data/processed --db-path data/manual_actions.sqlite
+Run locally:
+    python -m streamlit run src/app.py -- --data-dir data/processed --db-path data/manual_actions.sqlite
 """
 
 from __future__ import annotations
@@ -10,9 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import sys
-import json
-import textwrap
 
 import numpy as np
 import pandas as pd
@@ -57,10 +54,11 @@ def load_generated_tables(data_dir: str):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    if "is_hidden" in events.columns:
-        events["is_hidden"] = events["is_hidden"].astype(str).str.lower().isin(["true", "1", "yes", "да"])
+    for col in ["is_hidden"]:
+        if col in events.columns:
+            events[col] = events[col].astype(str).str.lower().isin(["true", "1", "yes", "да"])
 
-    for col in ["message_count", "chat_count", "author_count", "negative_count", "toxic_count"]:
+    for col in ["message_count", "chat_count", "author_count", "negative_count", "toxic_count", "discussion_count"]:
         if col in events.columns:
             events[col] = pd.to_numeric(events[col], errors="coerce").fillna(0).astype(int)
 
@@ -92,7 +90,6 @@ def resolve_merge_map(merges: pd.DataFrame) -> dict[str, str]:
 
 def apply_manual_edits(
     events: pd.DataFrame,
-    discussions: pd.DataFrame,
     messages: pd.DataFrame,
     discussion_messages: pd.DataFrame,
     event_discussions: pd.DataFrame,
@@ -112,7 +109,6 @@ def apply_manual_edits(
     else:
         events["final_event_id"] = events["event_id"]
 
-    # Apply message-level moves.
     if message_overrides is not None and not message_overrides.empty:
         move_map = {
             r["message_id"]: r["target_event_id"]
@@ -135,24 +131,37 @@ def apply_manual_edits(
     enriched_messages = messages.merge(msg_event, on="message_id", how="left")
 
     if message_overrides is not None and not message_overrides.empty:
-        hidden_msg = set(message_overrides.loc[message_overrides["hidden"].astype(str).isin(["1", "true", "True"]), "message_id"])
+        hidden_msg = set(
+            message_overrides.loc[
+                message_overrides["hidden"].astype(str).isin(["1", "true", "True"]),
+                "message_id",
+            ]
+        )
         enriched_messages["message_hidden"] = enriched_messages["message_id"].isin(hidden_msg)
     else:
         enriched_messages["message_hidden"] = False
 
-    # Aggregate generated events after merges.
     rows = []
     for final_id, group in events.groupby("final_event_id", sort=False):
         target = events[events["event_id"] == final_id]
         base = target.iloc[0] if len(target) else group.iloc[0]
 
         group_messages = enriched_messages[
-            (enriched_messages["final_event_id"] == final_id) & (~enriched_messages["message_hidden"])
+            (enriched_messages["final_event_id"] == final_id) & (~enriched_messages["message_hidden"].astype(bool))
         ]
 
-        all_tags = sorted(set(t for tags in group["main_tags"].fillna("") for t in str(tags).split("|") if t.strip()))
-        start_date = group_messages["datetime"].min() if "datetime" in group_messages else group["start_date"].min()
-        end_date = group_messages["datetime"].max() if "datetime" in group_messages else group["end_date"].max()
+        all_tags = sorted(set(t for tags in group.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
+        keywords = sorted(set(t for tags in group.get("keywords", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
+        phrases = sorted(set(t for tags in group.get("key_phrases", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
+
+        start_date = group_messages["datetime"].min() if "datetime" in group_messages and len(group_messages) else group["start_date"].min()
+        end_date = group_messages["datetime"].max() if "datetime" in group_messages and len(group_messages) else group["end_date"].max()
+
+        msg_count = int(group_messages["message_id"].nunique()) if len(group_messages) else int(group["message_count"].sum())
+        chat_count = int(group_messages["chat_id"].nunique()) if "chat_id" in group_messages and len(group_messages) else int(group["chat_count"].sum())
+        author_count = int(group_messages["author_id"].nunique()) if "author_id" in group_messages and len(group_messages) else int(group["author_count"].sum())
+        negative_count = int(group_messages["is_negative"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_negative" in group_messages and len(group_messages) else int(group["negative_count"].sum())
+        toxic_count = int(group_messages["is_toxic"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_toxic" in group_messages and len(group_messages) else int(group["toxic_count"].sum())
 
         rows.append({
             "event_id": final_id,
@@ -160,15 +169,16 @@ def apply_manual_edits(
             "event_summary": base.get("event_summary", ""),
             "main_tag": base.get("main_tag", ""),
             "main_tags": "|".join(all_tags),
-            "keywords": base.get("keywords", ""),
+            "keywords": "|".join(keywords),
+            "key_phrases": "|".join(phrases),
             "start_date": start_date,
             "end_date": end_date,
             "discussion_count": int(links[links["event_id"] == final_id]["discussion_id"].nunique()) if len(links) else 0,
-            "message_count": int(group_messages["message_id"].nunique()) if len(group_messages) else int(group["message_count"].sum()),
-            "chat_count": int(group_messages["chat_id"].nunique()) if "chat_id" in group_messages else int(group["chat_count"].sum()),
-            "author_count": int(group_messages["author_id"].nunique()) if "author_id" in group_messages else int(group["author_count"].sum()),
-            "negative_count": int(group_messages["is_negative"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_negative" in group_messages else int(group["negative_count"].sum()),
-            "toxic_count": int(group_messages["is_toxic"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_toxic" in group_messages else int(group["toxic_count"].sum()),
+            "message_count": msg_count,
+            "chat_count": chat_count,
+            "author_count": author_count,
+            "negative_count": negative_count,
+            "toxic_count": toxic_count,
             "importance_score": float(group["importance_score"].max()),
             "status": base.get("status", "новый"),
             "is_hidden": False,
@@ -176,7 +186,6 @@ def apply_manual_edits(
 
     visible_events = pd.DataFrame(rows)
 
-    # Apply event overrides.
     if overrides is not None and not overrides.empty and len(visible_events):
         ov = overrides.set_index("event_id")
         for idx, row in visible_events.iterrows():
@@ -208,129 +217,212 @@ def apply_manual_edits(
         )
         visible_events = visible_events.sort_values(["importance_score", "message_count"], ascending=False)
 
-    return visible_events, enriched_messages, links
+    return visible_events, enriched_messages
 
 
 def format_pct(value) -> str:
     try:
-        return f"{float(value) * 100:.1f}%"
+        return f"{float(value) * 100:.0f}%"
     except Exception:
-        return "0.0%"
+        return "0%"
 
 
-def event_filters(events: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.header("Фильтры инфоповодов")
+def format_period(row: pd.Series) -> str:
+    start = row.get("start_date")
+    end = row.get("end_date")
+    start_s = start.strftime("%d.%m %H:%M") if pd.notna(start) else ""
+    end_s = end.strftime("%d.%m %H:%M") if pd.notna(end) else ""
+    return f"{start_s} — {end_s}" if end_s else start_s
 
-    show_hidden = st.sidebar.checkbox("Показывать скрытые", value=False)
-    if not show_hidden and "is_hidden" in events.columns:
-        events = events[~events["is_hidden"].astype(bool)]
 
-    all_tags = sorted(set(t for tags in events.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
-    selected_tags = st.sidebar.multiselect("Теги", all_tags)
+def get_selected_rows(event) -> list[int]:
+    try:
+        return list(event.selection.rows)
+    except Exception:
+        try:
+            return list(event.get("selection", {}).get("rows", []))
+        except Exception:
+            return []
 
-    statuses = sorted(set(events.get("status", pd.Series(dtype=str)).fillna("").astype(str))) if len(events) else []
-    selected_statuses = st.sidebar.multiselect("Статус", statuses)
 
-    q = st.sidebar.text_input("Поиск по названию / описанию")
-    min_importance = st.sidebar.slider("Минимальная важность", 0.0, float(max(events["importance_score"].max(), 1.0)) if len(events) else 1.0, 0.0)
+def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
+    st.sidebar.header("Фильтры")
 
     filtered = events.copy()
+    if filtered.empty:
+        return filtered
+
+    q = st.sidebar.text_input("Поиск по теме", placeholder="например: налог, забастовка, WB")
+    all_tags = sorted(set(t for tags in filtered.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
+    selected_tags = st.sidebar.multiselect("Теги", all_tags)
+
+    statuses = [s for s in STATUS_OPTIONS if s in set(filtered.get("status", pd.Series(dtype=str)).fillna("").astype(str))]
+    selected_statuses = st.sidebar.multiselect("Статус", statuses)
+
+    min_messages = st.sidebar.slider(
+        "Минимум сообщений",
+        min_value=1,
+        max_value=int(max(filtered["message_count"].max(), 1)),
+        value=min(3, int(max(filtered["message_count"].max(), 1))),
+    )
+
+    only_attention = st.sidebar.checkbox("Только требующие внимания", value=False)
+
+    with st.sidebar.expander("Дополнительно", expanded=False):
+        show_hidden = st.checkbox("Показывать скрытые", value=False)
+        negative_only = st.checkbox("Только с негативом", value=False)
+        min_importance = st.slider(
+            "Минимальная важность",
+            0.0,
+            float(max(filtered["importance_score"].max(), 1.0)),
+            0.0,
+        )
+
+    if not show_hidden and "is_hidden" in filtered.columns:
+        filtered = filtered[~filtered["is_hidden"].astype(bool)]
+
+    if q:
+        q_low = q.lower()
+        haystack = (
+            filtered["event_title"].fillna("").astype(str)
+            + " "
+            + filtered["event_summary"].fillna("").astype(str)
+            + " "
+            + filtered.get("keywords", pd.Series([""] * len(filtered))).fillna("").astype(str)
+            + " "
+            + filtered.get("key_phrases", pd.Series([""] * len(filtered))).fillna("").astype(str)
+        ).str.lower()
+        filtered = filtered[haystack.str.contains(q_low, regex=False, na=False)]
+
     if selected_tags:
         filtered = filtered[
             filtered["main_tags"].fillna("").apply(
-                lambda x: any(tag in str(x).split("|") for tag in selected_tags)
+                lambda x: bool(set(selected_tags) & {t.strip() for t in str(x).split("|") if t.strip()})
             )
         ]
+
     if selected_statuses:
         filtered = filtered[filtered["status"].isin(selected_statuses)]
-    if q:
-        qq = q.lower()
-        filtered = filtered[
-            filtered["event_title"].fillna("").str.lower().str.contains(qq, regex=False)
-            | filtered["event_summary"].fillna("").str.lower().str.contains(qq, regex=False)
-            | filtered["keywords"].fillna("").str.lower().str.contains(qq, regex=False)
-        ]
+
+    filtered = filtered[filtered["message_count"] >= min_messages]
     filtered = filtered[filtered["importance_score"] >= min_importance]
-    return filtered
+
+    if negative_only:
+        filtered = filtered[filtered["negative_count"] > 0]
+
+    if only_attention:
+        filtered = filtered[
+            (filtered["importance_score"] >= filtered["importance_score"].quantile(0.70))
+            | (filtered["negative_share"] >= 0.25)
+            | (filtered["toxic_share"] >= 0.10)
+            | (filtered["main_tags"].fillna("").str.contains("Забастовка|Законы", regex=True))
+        ]
+
+    return filtered.sort_values(["importance_score", "message_count"], ascending=False)
 
 
-def show_overview(events: pd.DataFrame, messages: pd.DataFrame):
-    st.subheader("Сводка")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Инфоповодов", len(events))
-    col2.metric("Сообщений", int(events["message_count"].sum()) if len(events) else 0)
-    col3.metric("Чатов", int(messages["chat_id"].nunique()) if "chat_id" in messages else 0)
-    col4.metric("Авторов", int(messages["author_id"].nunique()) if "author_id" in messages else 0)
-
-    col5, col6, col7 = st.columns(3)
-    neg = int(events["negative_count"].sum()) if "negative_count" in events else 0
-    tox = int(events["toxic_count"].sum()) if "toxic_count" in events else 0
-    col5.metric("Негативных сообщений", neg)
-    col6.metric("Токсичных сообщений", tox)
-    col7.metric("Средняя важность", round(float(events["importance_score"].mean()), 2) if len(events) else 0)
-
-    st.subheader("Топ тегов по инфоповодам")
-    tag_counter = {}
-    for tags in events.get("main_tags", pd.Series(dtype=str)).fillna(""):
-        for tag in str(tags).split("|"):
-            tag = tag.strip()
-            if tag:
-                tag_counter[tag] = tag_counter.get(tag, 0) + 1
-    if tag_counter:
-        tag_df = pd.DataFrame(
-            [{"tag": k, "events": v} for k, v in tag_counter.items()]
-        ).sort_values("events", ascending=False)
-        st.bar_chart(tag_df.set_index("tag"))
-    else:
-        st.info("Теги не найдены.")
+def show_kpis(events: pd.DataFrame):
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Инфоповодов", f"{len(events):,}".replace(",", " "))
+    c2.metric("Сообщений", f"{int(events['message_count'].sum()) if len(events) else 0:,}".replace(",", " "))
+    c3.metric("Чатов", int(events["chat_count"].max()) if len(events) else 0)
+    c4.metric("Негатив", format_pct(events["negative_count"].sum() / events["message_count"].sum()) if len(events) and events["message_count"].sum() else "0%")
+    c5.metric("Высокая важность", int((events["importance_score"] >= events["importance_score"].quantile(0.75)).sum()) if len(events) else 0)
 
 
-def show_events_table(events: pd.DataFrame) -> str | None:
-    st.subheader("Инфоповоды")
-
-    table = events.copy()
-    if len(table) == 0:
+def event_table(events: pd.DataFrame) -> str | None:
+    if events.empty:
         st.info("Нет инфоповодов по выбранным фильтрам.")
         return None
 
-    table["period"] = (
-        table["start_date"].dt.strftime("%d.%m %H:%M").fillna("")
-        + " — "
-        + table["end_date"].dt.strftime("%d.%m %H:%M").fillna("")
-    )
-    table["negative_share"] = table["negative_share"].apply(format_pct)
-    table["toxic_share"] = table["toxic_share"].apply(format_pct)
+    table = events.copy()
+    table["Период"] = table.apply(format_period, axis=1)
+    table["Негатив"] = table["negative_share"].apply(format_pct)
+    table["Токсичность"] = table["toxic_share"].apply(format_pct)
+    table["Теги"] = table["main_tags"].fillna("").astype(str).str.replace("|", ", ", regex=False)
+    table["Название"] = table["event_title"]
+    table["Описание"] = table["event_summary"]
+    table["Сообщений"] = table["message_count"]
+    table["Чатов"] = table["chat_count"]
+    table["Авторов"] = table["author_count"]
+    table["Важность"] = table["importance_score"].round(1)
+    table["Статус"] = table["status"]
 
-    show_cols = [
+    display_cols = [
         "event_id",
-        "event_title",
-        "main_tags",
-        "period",
-        "message_count",
-        "chat_count",
-        "author_count",
-        "negative_share",
-        "toxic_share",
-        "importance_score",
-        "status",
+        "Название",
+        "Описание",
+        "Теги",
+        "Период",
+        "Сообщений",
+        "Чатов",
+        "Негатив",
+        "Важность",
+        "Статус",
     ]
-    show_cols = [c for c in show_cols if c in table.columns]
 
-    event = st.dataframe(
-        table[show_cols],
+    st.subheader("Инфоповоды")
+    selected = st.dataframe(
+        table[display_cols],
         use_container_width=True,
-        height=430,
+        height=520,
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
+        column_config={
+            "event_id": None,
+            "Описание": st.column_config.TextColumn(width="large"),
+            "Название": st.column_config.TextColumn(width="medium"),
+            "Теги": st.column_config.TextColumn(width="medium"),
+            "Сообщений": st.column_config.NumberColumn(format="%d"),
+            "Чатов": st.column_config.NumberColumn(format="%d"),
+            "Важность": st.column_config.NumberColumn(format="%.1f"),
+        },
     )
 
-    rows = event.selection.rows if hasattr(event, "selection") else []
+    rows = get_selected_rows(selected)
     if rows:
         return table.iloc[rows[0]]["event_id"]
-
     return table.iloc[0]["event_id"]
+
+
+def message_preview_cards(event_messages: pd.DataFrame, limit: int = 8):
+    if event_messages.empty:
+        st.info("Сообщения не найдены.")
+        return
+
+    work = event_messages.copy()
+    work["text_len"] = work["text_clean"].fillna("").astype(str).str.len()
+    if "is_negative" in work.columns:
+        work["_rank_negative"] = work["is_negative"].astype(str).str.lower().isin(["true", "1"]).astype(int)
+    else:
+        work["_rank_negative"] = 0
+
+    sample = (
+        work.sort_values(["_rank_negative", "text_len"], ascending=False)
+        .head(limit)
+        .sort_values("datetime")
+    )
+
+    for _, row in sample.iterrows():
+        when = row["datetime"].strftime("%d.%m.%Y %H:%M") if pd.notna(row.get("datetime")) else ""
+        chat = row.get("chat_title", "")
+        author = row.get("author", "")
+        text = str(row.get("text_clean", "")).strip()
+        sentiment = str(row.get("sentiment", "")).strip()
+        link = str(row.get("message_link", "")).strip()
+
+        st.markdown(
+            f"""
+<div style="padding: 0.75rem 0; border-bottom: 1px solid rgba(128,128,128,.25);">
+  <div style="font-size: 0.88rem; opacity: .75;">{when} · {chat} · {author} · {sentiment}</div>
+  <div style="margin-top: .25rem; white-space: pre-wrap;">{text[:1200]}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        if link.startswith("http"):
+            st.markdown(f"[Открыть сообщение]({link})")
 
 
 def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame, conn):
@@ -340,9 +432,14 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         return
 
     ev = selected.iloc[0]
+    event_messages = messages[
+        (messages["final_event_id"] == event_id)
+        & (~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool))
+    ].copy()
+    event_messages = event_messages.sort_values("datetime")
 
     st.markdown("---")
-    st.subheader(ev["event_title"])
+    st.header(ev["event_title"])
     st.write(ev.get("event_summary", ""))
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -350,9 +447,75 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     c2.metric("Чатов", int(ev.get("chat_count", 0)))
     c3.metric("Авторов", int(ev.get("author_count", 0)))
     c4.metric("Негатив", format_pct(ev.get("negative_share", 0)))
-    c5.metric("Важность", ev.get("importance_score", 0))
+    c5.metric("Важность", round(float(ev.get("importance_score", 0)), 1))
 
-    with st.expander("Ручная правка инфоповода", expanded=False):
+    tags = str(ev.get("main_tags", "")).replace("|", " · ")
+    keywords = str(ev.get("keywords", "")).replace("|", ", ")
+    phrases = str(ev.get("key_phrases", "")).replace("|", ", ")
+
+    st.caption(f"Теги: {tags}")
+    if phrases or keywords:
+        st.caption(f"Ключевые сигналы: {phrases or keywords}")
+
+    tab_messages, tab_all, tab_edit = st.tabs(["Ключевые сообщения", "Вся лента", "Правки"])
+
+    with tab_messages:
+        message_preview_cards(event_messages, limit=10)
+
+    with tab_all:
+        if event_messages.empty:
+            st.info("Сообщения не найдены.")
+        else:
+            table = event_messages.copy()
+            table["Текст"] = table["text_clean"].fillna("").astype(str).str.slice(0, 300)
+            table["Дата"] = table["datetime"]
+            table["Чат"] = table.get("chat_title", "")
+            table["Автор"] = table.get("author", "")
+            table["Тональность"] = table.get("sentiment", "")
+            table["Теги"] = table.get("tags", "")
+
+            cols = ["message_id", "Дата", "Чат", "Автор", "Тональность", "Теги", "Текст", "message_link"]
+            msg_select = st.dataframe(
+                table[cols],
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={
+                    "message_id": None,
+                    "message_link": st.column_config.LinkColumn("Ссылка"),
+                    "Текст": st.column_config.TextColumn(width="large"),
+                },
+            )
+
+            rows = get_selected_rows(msg_select)
+            if rows:
+                row = table.iloc[rows[0]]
+                st.markdown("#### Полный текст")
+                st.write(row.get("text_clean", ""))
+                with st.expander("Перенести или скрыть это сообщение", expanded=False):
+                    target_options = events[["event_id", "event_title"]].copy()
+                    target_options["label"] = target_options["event_id"] + " — " + target_options["event_title"].astype(str).str.slice(0, 100)
+                    current_matches = target_options.index[target_options["event_id"] == event_id].tolist()
+                    current_idx = int(current_matches[0]) if current_matches else 0
+                    target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
+                    msg_note = st.text_input("Комментарий", value="")
+                    col_a, col_b = st.columns(2)
+                    if col_a.button("Перенести сообщение"):
+                        target_id = target_label.split(" — ", 1)[0]
+                        move_message(conn, row["message_id"], target_id, note=msg_note)
+                        st.success("Сообщение перенесено.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    if col_b.button("Скрыть сообщение"):
+                        hide_message(conn, row["message_id"], hidden=True, note=msg_note)
+                        st.success("Сообщение скрыто.")
+                        st.cache_data.clear()
+                        st.rerun()
+
+    with tab_edit:
+        st.markdown("#### Ручная правка инфоповода")
         with st.form(f"edit_event_{event_id}"):
             title = st.text_input("Название", value=str(ev.get("event_title", "")))
             summary = st.text_area("Описание", value=str(ev.get("event_summary", "")), height=120)
@@ -363,80 +526,27 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
             )
             hidden = st.checkbox("Скрыть инфоповод", value=bool(ev.get("is_hidden", False)))
             note = st.text_area("Комментарий модератора", value="", height=80)
-            submitted = st.form_submit_button("Сохранить правки")
+            submitted = st.form_submit_button("Сохранить")
             if submitted:
                 save_event_override(conn, event_id, title=title, summary=summary, status=status, hidden=hidden, note=note)
                 st.success("Правки сохранены.")
                 st.cache_data.clear()
                 st.rerun()
 
-    with st.expander("Объединить с другим инфоповодом", expanded=False):
+        st.markdown("#### Объединить с другим инфоповодом")
         candidates = events[events["event_id"] != event_id][["event_id", "event_title"]].copy()
-        candidates["label"] = candidates["event_id"] + " — " + candidates["event_title"].astype(str).str.slice(0, 100)
+        candidates["label"] = candidates["event_id"] + " — " + candidates["event_title"].astype(str).str.slice(0, 120)
         target_label = st.selectbox("Целевой инфоповод", candidates["label"].tolist() if len(candidates) else [])
         reason = st.text_input("Причина объединения", value="")
-        if st.button("Объединить выбранный инфоповод с целевым", disabled=not bool(target_label)):
+        if st.button("Объединить", disabled=not bool(target_label)):
             target_id = target_label.split(" — ", 1)[0]
             try:
                 merge_events(conn, source_event_id=event_id, target_event_id=target_id, reason=reason)
-                st.success(f"Инфоповод {event_id} объединен с {target_id}.")
+                st.success(f"Инфоповод объединен с {target_id}.")
                 st.cache_data.clear()
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-
-    st.subheader("Сообщения внутри инфоповода")
-    event_messages = messages[
-        (messages["final_event_id"] == event_id)
-        & (~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool))
-    ].copy()
-
-    if event_messages.empty:
-        st.info("Сообщения не найдены.")
-        return
-
-    event_messages = event_messages.sort_values("datetime")
-    event_messages["preview"] = event_messages["text_clean"].fillna("").astype(str).str.slice(0, 250)
-    msg_cols = ["message_id", "datetime", "chat_title", "author", "sentiment", "tags", "preview", "message_link"]
-    msg_cols = [c for c in msg_cols if c in event_messages.columns]
-
-    msg_event = st.dataframe(
-        event_messages[msg_cols],
-        use_container_width=True,
-        height=360,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-    )
-    rows = msg_event.selection.rows if hasattr(msg_event, "selection") else []
-
-    if rows:
-        row = event_messages.iloc[rows[0]]
-        st.markdown("#### Полный текст выбранного сообщения")
-        st.write(row.get("text_clean", ""))
-
-        link = row.get("message_link", "")
-        if isinstance(link, str) and link.startswith("http"):
-            st.markdown(f"[Открыть в Telegram]({link})")
-
-        with st.expander("Ручная правка выбранного сообщения", expanded=False):
-            target_options = events[["event_id", "event_title"]].copy()
-            target_options["label"] = target_options["event_id"] + " — " + target_options["event_title"].astype(str).str.slice(0, 100)
-            current_idx = int(target_options[target_options["event_id"] == event_id].index[0]) if event_id in target_options["event_id"].values else 0
-            target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
-            msg_note = st.text_input("Комментарий к переносу / скрытию", value="")
-            col_a, col_b = st.columns(2)
-            if col_a.button("Перенести сообщение"):
-                target_id = target_label.split(" — ", 1)[0]
-                move_message(conn, row["message_id"], target_id, note=msg_note)
-                st.success("Сообщение перенесено.")
-                st.cache_data.clear()
-                st.rerun()
-            if col_b.button("Скрыть сообщение"):
-                hide_message(conn, row["message_id"], hidden=True, note=msg_note)
-                st.success("Сообщение скрыто.")
-                st.cache_data.clear()
-                st.rerun()
 
 
 def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
@@ -444,8 +554,8 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
 
     col1, col2, col3 = st.columns(3)
     q = col1.text_input("Текст")
-    tag = col2.text_input("Тег содержит")
-    chat = col3.text_input("Чат содержит")
+    tag = col2.text_input("Тег")
+    chat = col3.text_input("Чат")
 
     filtered = messages[~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool)].copy()
 
@@ -457,11 +567,25 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
         filtered = filtered[filtered["chat_title"].fillna("").str.lower().str.contains(chat.lower(), regex=False)]
 
     filtered = filtered.sort_values("datetime", ascending=False).head(500)
-    filtered["preview"] = filtered["text_clean"].fillna("").astype(str).str.slice(0, 300)
-    cols = ["message_id", "datetime", "chat_title", "author", "tags", "sentiment", "final_event_id", "preview", "message_link"]
+    filtered["Текст"] = filtered["text_clean"].fillna("").astype(str).str.slice(0, 350)
+    filtered["Дата"] = filtered["datetime"]
+    filtered["Чат"] = filtered.get("chat_title", "")
+    filtered["Автор"] = filtered.get("author", "")
+    filtered["Инфоповод"] = filtered.get("final_event_id", "")
+    filtered["Ссылка"] = filtered.get("message_link", "")
+    cols = ["Дата", "Чат", "Автор", "tags", "sentiment", "Инфоповод", "Текст", "Ссылка"]
     cols = [c for c in cols if c in filtered.columns]
 
-    st.dataframe(filtered[cols], use_container_width=True, height=600, hide_index=True)
+    st.dataframe(
+        filtered[cols],
+        use_container_width=True,
+        height=640,
+        hide_index=True,
+        column_config={
+            "Ссылка": st.column_config.LinkColumn("Ссылка"),
+            "Текст": st.column_config.TextColumn(width="large"),
+        },
+    )
 
 
 def main():
@@ -474,7 +598,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("MVP: сообщения → обсуждения → инфоповоды + ручная модерация")
+    st.caption("Версия 0.2: очищенные названия, дробление широких тем, упрощенный интерфейс")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -490,9 +614,8 @@ def main():
     merges = get_event_merges(conn)
     msg_overrides = get_message_overrides(conn)
 
-    events, enriched_messages, links = apply_manual_edits(
+    events, enriched_messages = apply_manual_edits(
         events_raw,
-        discussions,
         messages,
         discussion_messages,
         event_discussions,
@@ -501,20 +624,17 @@ def main():
         msg_overrides,
     )
 
-    filtered_events = event_filters(events)
+    page = st.sidebar.radio("Раздел", ["Инфоповоды", "Поиск сообщений"], label_visibility="collapsed")
 
-    tab1, tab2, tab3 = st.tabs(["Обзор", "Инфоповоды", "Поиск сообщений"])
+    if page == "Поиск сообщений":
+        show_message_search(enriched_messages, events, conn)
+        return
 
-    with tab1:
-        show_overview(filtered_events, enriched_messages)
-
-    with tab2:
-        selected_event_id = show_events_table(filtered_events)
-        if selected_event_id:
-            show_event_card(selected_event_id, filtered_events, enriched_messages, conn)
-
-    with tab3:
-        show_message_search(enriched_messages, filtered_events, conn)
+    filtered_events = apply_filters(events)
+    show_kpis(filtered_events)
+    selected_event_id = event_table(filtered_events)
+    if selected_event_id:
+        show_event_card(selected_event_id, filtered_events, enriched_messages, conn)
 
 
 if __name__ == "__main__":

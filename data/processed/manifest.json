@@ -3,7 +3,7 @@
   "rows_source": 8383,
   "rows_messages": 8383,
   "rows_discussions": 5200,
-  "rows_events": 1469,
+  "rows_events": 2925,
   "tag_columns": [
     "Коэффициент",
     "Законы и налоги",
@@ -16,14 +16,15 @@
   ],
   "window_minutes": 60,
   "cluster_method": "tfidf",
-  "similarity_threshold": 0.25,
+  "similarity_threshold": 0.32,
   "event_gap_hours": 1.0,
+  "event_window_hours": 12.0,
   "paths": {
-    "messages": "/mnt/data/taxi_chat_dashboard/data/processed/messages.csv",
-    "message_tags": "/mnt/data/taxi_chat_dashboard/data/processed/message_tags.csv",
-    "discussions": "/mnt/data/taxi_chat_dashboard/data/processed/discussions.csv",
-    "discussion_messages": "/mnt/data/taxi_chat_dashboard/data/processed/discussion_messages.csv",
-    "events": "/mnt/data/taxi_chat_dashboard/data/processed/events.csv",
-    "event_discussions": "/mnt/data/taxi_chat_dashboard/data/processed/event_discussions.csv"
+    "messages": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/messages.csv",
+    "message_tags": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/message_tags.csv",
+    "discussions": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/discussions.csv",
+    "discussion_messages": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/discussion_messages.csv",
+    "events": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/events.csv",
+    "event_discussions": "/mnt/data/taxi_chat_dashboard_v2/taxi_chat_dashboard/data/processed/event_discussions.csv"
   }
 }

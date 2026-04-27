@@ -23,7 +23,9 @@ from settings import (
     TAG_COLUMNS_DEFAULT,
     TEXT_PREFIXES_TO_REMOVE,
     RUSSIAN_STOPWORDS,
+    KEYWORD_STOPWORDS,
     CRITICAL_TAG_WEIGHTS,
+    TITLE_RULES,
 )
 from io_utils import read_source_csv, write_table, write_manifest
 
@@ -294,17 +296,37 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
     return discussions, discussion_messages
 
 
-def tokenize_ru(text: str) -> list[str]:
+def tokenize_ru(text: str, *, for_keywords: bool = False) -> list[str]:
     text = str(text).lower().replace("ё", "е")
+    text = re.sub(r"https?://\S+|t\.me/\S+", " ", text)
     tokens = re.findall(r"[а-яa-z0-9]{3,}", text)
-    return [t for t in tokens if t not in RUSSIAN_STOPWORDS and not t.isdigit()]
+    stop = KEYWORD_STOPWORDS if for_keywords else RUSSIAN_STOPWORDS
+    return [t for t in tokens if t not in stop and not t.isdigit()]
 
 
-def top_keywords(texts: Iterable[str], top_n: int = 5) -> list[str]:
+def top_keywords(texts: Iterable[str], top_n: int = 7) -> list[str]:
+    """
+    Возвращает чистые ключевые слова для карточки инфоповода.
+    В отличие от TF-IDF токенизации, здесь жестче режем мат, бренды и слишком общие слова.
+    """
     counter: Counter[str] = Counter()
     for text in texts:
-        counter.update(tokenize_ru(text))
+        counter.update(tokenize_ru(text, for_keywords=True))
     return [w for w, _ in counter.most_common(top_n)]
+
+
+def top_phrases(texts: Iterable[str], top_n: int = 5) -> list[str]:
+    """
+    Простая вытяжка устойчивых 2-словных фраз.
+    Нужна не для ML, а для более понятного названия/описания.
+    """
+    counter: Counter[str] = Counter()
+    for text in texts:
+        tokens = tokenize_ru(text, for_keywords=True)
+        for a, b in zip(tokens, tokens[1:]):
+            if a != b:
+                counter[f"{a} {b}"] += 1
+    return [p for p, c in counter.most_common(top_n) if c >= 2]
 
 
 def main_tag(tags_series: Iterable[str]) -> str:
@@ -313,40 +335,108 @@ def main_tag(tags_series: Iterable[str]) -> str:
         for tag in str(tags).split("|"):
             tag = tag.strip()
             if tag:
-                counter[tag] += 1
+                # "яндекс" слишком широкий тег, по возможности уступает более предметным тегам.
+                weight = 0.45 if tag == "яндекс" else 1.0
+                counter[tag] += weight
     return counter.most_common(1)[0][0] if counter else "Без тега"
 
 
-def build_title(tag: str, keywords: list[str]) -> str:
+def tag_set_from_series(tags_series: Iterable[str]) -> set[str]:
+    result = set()
+    for tags in tags_series:
+        for tag in str(tags).split("|"):
+            tag = tag.strip()
+            if tag:
+                result.add(tag)
+    return result
+
+
+def build_title(tag: str, keywords: list[str], all_tags: Iterable[str] | None = None) -> str:
+    all_tags = set(all_tags or [])
+    kw = set(keywords)
+
+    for rule in TITLE_RULES:
+        if all_tags & set(rule.get("tags", set())) and (not rule.get("keywords") or kw & set(rule.get("keywords", set()))):
+            return rule["title"]
+
     if tag == "Забастовка":
-        return "Обсуждение забастовки водителей"
+        return "Призывы к забастовке или бойкоту"
     if tag == "Приложение и сбои":
         return "Сбои и проблемы в приложении"
     if tag == "Яндекс Про":
         return "Проблемы с Яндекс Про"
     if tag == "Законы и налоги":
-        return "Законы, налоги и регулирование"
+        return "Законы, налоги и регулирование такси"
     if tag == "Коэффициент":
-        return "Обсуждение коэффициентов и тарифов"
+        return "Коэффициенты, приоритет и тарифы"
+    if tag == "WB Такси":
+        return "Запуск и обсуждение WB Такси"
+    if tag == "Фастен":
+        return "Обсуждение сервиса Фастен"
+
+    if tag == "яндекс":
+        if any(k in kw for k in ["дивиденды", "акции", "акционеры"]):
+            return "Финансовые новости и обсуждение Яндекса"
+        if any(k in kw for k in ["кресло", "кресла", "детским"]):
+            return "Детские кресла и требования к заказам"
+        return "Общее обсуждение Яндекса"
+
     if keywords:
         return f"{tag}: {', '.join(keywords[:3])}"
     return f"Обсуждение: {tag}"
 
 
-def summarize_event(group: pd.DataFrame, tag: str, keywords: list[str]) -> str:
+def summarize_event(group: pd.DataFrame, tag: str, keywords: list[str], phrases: list[str]) -> str:
     start = pd.to_datetime(group["start_date"], errors="coerce").min()
     end = pd.to_datetime(group["end_date"], errors="coerce").max()
     start_s = start.strftime("%d.%m.%Y %H:%M") if pd.notna(start) else "неизвестно"
     end_s = end.strftime("%d.%m.%Y %H:%M") if pd.notna(end) else "неизвестно"
     msg_count = int(group["message_count"].sum())
     chat_count = int(group["chat_id"].replace("", np.nan).nunique()) if "chat_id" in group else 0
-    kw_text = ", ".join(keywords[:5]) if keywords else "ключевые слова не выделены"
+    author_count = int(group["author_count"].sum()) if "author_count" in group else 0
+
+    details = phrases[:3] or keywords[:5]
+    detail_text = ", ".join(details) if details else "без устойчивых ключевых слов"
+
     return (
-        f"Инфоповод по теме «{tag}» за период {start_s} — {end_s}. "
-        f"Внутри {msg_count} сообщений, чатов: {chat_count}. "
-        f"Частые слова: {kw_text}."
+        f"Тема «{tag}» обсуждалась с {start_s} по {end_s}. "
+        f"Внутри: {msg_count} сообщений, {chat_count} чатов, {author_count} участников. "
+        f"Ключевые сигналы: {detail_text}."
     )
 
+
+def split_labels_by_fixed_time_window(
+    labels: pd.Series,
+    discussions: pd.DataFrame,
+    window_hours: float = 12.0,
+) -> pd.Series:
+    """
+    Дополнительное дробление широких кластеров на временные волны.
+    Это защищает от ситуации, когда большой тег вроде «яндекс» или «Коэффициент»
+    склеивает обсуждения за несколько дней в один инфоповод.
+    """
+    if window_hours <= 0 or len(discussions) == 0:
+        return labels.astype(int)
+
+    d = discussions.copy()
+    d["_label"] = labels.loc[d.index].astype(int)
+    d["_start"] = pd.to_datetime(d["start_date"], errors="coerce")
+    fallback = pd.Timestamp("1970-01-01")
+    d["_bucket"] = (
+        d["_start"].fillna(fallback).astype("int64")
+        // int(pd.Timedelta(hours=window_hours).value)
+    )
+
+    mapping = {}
+    next_label = 0
+    result = pd.Series(index=d.index, dtype=int)
+    for idx, row in d.iterrows():
+        key = (int(row["_label"]), int(row["_bucket"]))
+        if key not in mapping:
+            mapping[key] = next_label
+            next_label += 1
+        result.loc[idx] = mapping[key]
+    return result.astype(int)
 
 def cluster_discussions_tfidf(
     discussions: pd.DataFrame,
@@ -367,12 +457,17 @@ def cluster_discussions_tfidf(
         tokenizer=tokenize_ru,
         token_pattern=None,
         ngram_range=(1, 2),
-        min_df=1,
-        max_df=0.85,
+        min_df=2,
+        max_df=0.60,
         max_features=max_features,
         sublinear_tf=True,
     )
-    X = vectorizer.fit_transform(texts)
+    try:
+        X = vectorizer.fit_transform(texts)
+    except ValueError:
+        # If the subset is too small for min_df=2, fall back to singleton clusters.
+        return pd.Series(range(len(discussions)), index=discussions.index, dtype=int)
+
     nonzero_mask = np.asarray(X.getnnz(axis=1) > 0).ravel()
 
     # Zero-vector rows have no useful lexical signal; make them singleton clusters.
@@ -510,6 +605,7 @@ def make_events(
     for event_id, group in d.groupby("event_id", sort=True):
         tag = main_tag(group["main_tags"])
         keywords = top_keywords(group["discussion_text"].fillna("").astype(str), top_n=7)
+        phrases = top_phrases(group["discussion_text"].fillna("").astype(str), top_n=5)
 
         start = pd.to_datetime(group["start_date"], errors="coerce").min()
         end = pd.to_datetime(group["end_date"], errors="coerce").max()
@@ -520,7 +616,7 @@ def make_events(
         negative_count = int(group["negative_count"].sum()) if "negative_count" in group else 0
         toxic_count = int(group["toxic_count"].sum()) if "toxic_count" in group else 0
 
-        all_tags = sorted(set(t for tags in group["main_tags"] for t in str(tags).split("|") if t.strip()))
+        all_tags = sorted(tag_set_from_series(group["main_tags"]))
         tag_weight = max([CRITICAL_TAG_WEIGHTS.get(t, 1.0) for t in all_tags] or [1.0])
         negative_share = negative_count / msg_count if msg_count else 0.0
         toxic_share = toxic_count / msg_count if msg_count else 0.0
@@ -536,11 +632,12 @@ def make_events(
 
         rows.append({
             "event_id": event_id,
-            "event_title": build_title(tag, keywords),
-            "event_summary": summarize_event(group, tag, keywords),
+            "event_title": build_title(tag, keywords, all_tags),
+            "event_summary": summarize_event(group, tag, keywords, phrases),
             "main_tag": tag,
             "main_tags": "|".join(all_tags),
             "keywords": "|".join(keywords),
+            "key_phrases": "|".join(phrases),
             "start_date": start,
             "end_date": end,
             "discussion_count": discussion_count,
@@ -568,6 +665,7 @@ def main() -> None:
     parser.add_argument("--cluster-method", choices=["tfidf", "embeddings", "none"], default="tfidf")
     parser.add_argument("--similarity-threshold", type=float, default=0.25)
     parser.add_argument("--event-gap-hours", type=float, default=1.0, help="Split clusters into separate events when the time gap is larger than this value")
+    parser.add_argument("--event-window-hours", type=float, default=12.0, help="Additionally split broad clusters into fixed time windows")
     parser.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     args = parser.parse_args()
 
@@ -601,6 +699,7 @@ def main() -> None:
     if len(clusterable):
         labels = refine_labels_by_tag(labels, clusterable)
         labels = split_labels_by_time_gap(labels, clusterable, max_gap_hours=args.event_gap_hours)
+        labels = split_labels_by_fixed_time_window(labels, clusterable, window_hours=args.event_window_hours)
 
     if len(non_clusterable):
         start_label = int(labels.max()) + 1 if len(labels) else 0
@@ -633,6 +732,7 @@ def main() -> None:
         "cluster_method": args.cluster_method,
         "similarity_threshold": args.similarity_threshold,
         "event_gap_hours": args.event_gap_hours,
+        "event_window_hours": args.event_window_hours,
         "paths": paths,
     }
     write_manifest(output, manifest)
