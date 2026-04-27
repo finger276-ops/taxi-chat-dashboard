@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +92,47 @@ def resolve_merge_map(merges: pd.DataFrame) -> dict[str, str]:
     return mapping
 
 
+def normalize_title_for_auto_merge(title: str) -> str:
+    """Normalize event title so visually identical topics are merged in the dashboard."""
+    value = str(title or "").strip().lower().replace("ё", "е")
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"\s*[—–-]\s*волна\s*\d+\s*$", "", value)
+    value = value.strip(" .,:;!?'\"«»()[]{}")
+    return value
+
+
+def build_auto_title_merge_map(events: pd.DataFrame) -> dict[str, str]:
+    """Map duplicate event titles to one representative event id.
+
+    This is intentionally done at the dashboard layer: source data stays detailed,
+    while the user sees one consolidated topic for identical event titles.
+    """
+    if events.empty or "final_event_id" not in events.columns or "event_title" not in events.columns:
+        return {}
+
+    representatives = (
+        events.groupby("final_event_id", as_index=False)
+        .agg(
+            event_title=("event_title", "first"),
+            message_count=("message_count", "sum"),
+            importance_score=("importance_score", "max"),
+        )
+    )
+    representatives["title_key"] = representatives["event_title"].apply(normalize_title_for_auto_merge)
+    representatives = representatives[representatives["title_key"].astype(str).str.len() > 0]
+
+    title_merge_map: dict[str, str] = {}
+    for _, group in representatives.groupby("title_key", sort=False):
+        if len(group) <= 1:
+            continue
+        ordered = group.sort_values(["message_count", "importance_score"], ascending=False)
+        target_id = str(ordered.iloc[0]["final_event_id"])
+        for source_id in ordered["final_event_id"].astype(str):
+            title_merge_map[source_id] = target_id
+
+    return title_merge_map
+
+
 def apply_manual_edits(
     events: pd.DataFrame,
     messages: pd.DataFrame,
@@ -106,16 +148,28 @@ def apply_manual_edits(
     msg_links = discussion_messages.merge(links, on="discussion_id", how="left")
 
     merge_map = resolve_merge_map(merges)
-    if merge_map:
-        links["event_id"] = links["event_id"].apply(lambda x: merge_map.get(x, x))
-        msg_links["event_id"] = msg_links["event_id"].apply(lambda x: merge_map.get(x, x))
-        events["final_event_id"] = events["event_id"].apply(lambda x: merge_map.get(x, x))
-    else:
-        events["final_event_id"] = events["event_id"]
+
+    def apply_manual_event_merge(event_id):
+        return merge_map.get(event_id, event_id)
+
+    links["event_id"] = links["event_id"].apply(apply_manual_event_merge)
+    msg_links["event_id"] = msg_links["event_id"].apply(apply_manual_event_merge)
+    events["final_event_id"] = events["event_id"].apply(apply_manual_event_merge)
+
+    auto_title_merge_map = build_auto_title_merge_map(events)
+
+    def canonical_event_id(event_id):
+        event_id = merge_map.get(event_id, event_id)
+        return auto_title_merge_map.get(str(event_id), event_id)
+
+    if auto_title_merge_map:
+        links["event_id"] = links["event_id"].apply(canonical_event_id)
+        msg_links["event_id"] = msg_links["event_id"].apply(canonical_event_id)
+        events["final_event_id"] = events["final_event_id"].apply(canonical_event_id)
 
     if message_overrides is not None and not message_overrides.empty:
         move_map = {
-            r["message_id"]: r["target_event_id"]
+            r["message_id"]: canonical_event_id(r["target_event_id"])
             for _, r in message_overrides.iterrows()
             if str(r.get("target_event_id", "")).strip()
         }
@@ -127,7 +181,7 @@ def apply_manual_edits(
 
     if message_exclusions is not None and not message_exclusions.empty and len(msg_links):
         exclusions = message_exclusions.copy()
-        exclusions["event_id"] = exclusions["event_id"].apply(lambda x: merge_map.get(x, x))
+        exclusions["event_id"] = exclusions["event_id"].apply(canonical_event_id)
         excluded_pairs = set(
             zip(
                 exclusions["message_id"].astype(str),
@@ -295,13 +349,6 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     statuses = [s for s in STATUS_OPTIONS if s in set(filtered.get("status", pd.Series(dtype=str)).fillna("").astype(str))]
     selected_statuses = st.sidebar.multiselect("Статус", statuses)
 
-    min_messages = st.sidebar.slider(
-        "Минимум сообщений",
-        min_value=1,
-        max_value=int(max(filtered["message_count"].max(), 1)),
-        value=min(3, int(max(filtered["message_count"].max(), 1))),
-    )
-
     only_attention = st.sidebar.checkbox("Только требующие внимания", value=False)
 
     with st.sidebar.expander("Дополнительно", expanded=False):
@@ -340,7 +387,6 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     if selected_statuses:
         filtered = filtered[filtered["status"].isin(selected_statuses)]
 
-    filtered = filtered[filtered["message_count"] >= min_messages]
     filtered = filtered[filtered["importance_score"] >= min_importance]
 
     if negative_only:
@@ -689,7 +735,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.6: даты в интерфейсе отображаются без времени в формате ДД.ММ.ГГГГ")
+    st.caption("Версия 0.7: убран фильтр минимума сообщений, одинаковые темы автоматически объединяются")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
