@@ -349,7 +349,6 @@ def event_table(events: pd.DataFrame) -> str | None:
     table["Статус"] = table["status"]
 
     display_cols = [
-        "event_id",
         "Название",
         "Описание",
         "Теги",
@@ -370,7 +369,6 @@ def event_table(events: pd.DataFrame) -> str | None:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "event_id": None,
             "Описание": st.column_config.TextColumn(width="large"),
             "Название": st.column_config.TextColumn(width="medium"),
             "Теги": st.column_config.TextColumn(width="medium"),
@@ -474,7 +472,8 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
             table["Тональность"] = table.get("sentiment", "")
             table["Теги"] = table.get("tags", "")
 
-            cols = ["message_id", "Дата", "Чат", "Автор", "Тональность", "Теги", "Текст", "message_link"]
+            table["Ссылка"] = table.get("message_link", "")
+            cols = ["Дата", "Чат", "Автор", "Тональность", "Теги", "Текст", "Ссылка"]
             msg_select = st.dataframe(
                 table[cols],
                 use_container_width=True,
@@ -483,8 +482,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 on_select="rerun",
                 selection_mode="single-row",
                 column_config={
-                    "message_id": None,
-                    "message_link": st.column_config.LinkColumn("Ссылка"),
+                    "Ссылка": st.column_config.LinkColumn("Ссылка"),
                     "Текст": st.column_config.TextColumn(width="large"),
                 },
             )
@@ -495,15 +493,18 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.markdown("#### Полный текст")
                 st.write(row.get("text_clean", ""))
                 with st.expander("Перенести или скрыть это сообщение", expanded=False):
-                    target_options = events[["event_id", "event_title"]].copy()
-                    target_options["label"] = target_options["event_id"] + " — " + target_options["event_title"].astype(str).str.slice(0, 100)
+                    target_options = events[["event_id", "event_title", "message_count"]].copy()
+                    target_options["label"] = target_options.apply(
+                        lambda r: f"{str(r['event_title'])[:110]} · {int(r.get('message_count', 0))} сообщ.",
+                        axis=1,
+                    )
                     current_matches = target_options.index[target_options["event_id"] == event_id].tolist()
                     current_idx = int(current_matches[0]) if current_matches else 0
                     target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
                     msg_note = st.text_input("Комментарий", value="")
                     col_a, col_b = st.columns(2)
                     if col_a.button("Перенести сообщение"):
-                        target_id = target_label.split(" — ", 1)[0]
+                        target_id = target_options.loc[target_options["label"] == target_label, "event_id"].iloc[0]
                         move_message(conn, row["message_id"], target_id, note=msg_note)
                         st.success("Сообщение перенесено.")
                         st.cache_data.clear()
@@ -534,12 +535,15 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.rerun()
 
         st.markdown("#### Объединить с другим инфоповодом")
-        candidates = events[events["event_id"] != event_id][["event_id", "event_title"]].copy()
-        candidates["label"] = candidates["event_id"] + " — " + candidates["event_title"].astype(str).str.slice(0, 120)
+        candidates = events[events["event_id"] != event_id][["event_id", "event_title", "message_count"]].copy()
+        candidates["label"] = candidates.apply(
+            lambda r: f"{str(r['event_title'])[:120]} · {int(r.get('message_count', 0))} сообщ.",
+            axis=1,
+        )
         target_label = st.selectbox("Целевой инфоповод", candidates["label"].tolist() if len(candidates) else [])
         reason = st.text_input("Причина объединения", value="")
         if st.button("Объединить", disabled=not bool(target_label)):
-            target_id = target_label.split(" — ", 1)[0]
+            target_id = candidates.loc[candidates["label"] == target_label, "event_id"].iloc[0]
             try:
                 merge_events(conn, source_event_id=event_id, target_event_id=target_id, reason=reason)
                 st.success(f"Инфоповод объединен с {target_id}.")
@@ -571,9 +575,12 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
     filtered["Дата"] = filtered["datetime"]
     filtered["Чат"] = filtered.get("chat_title", "")
     filtered["Автор"] = filtered.get("author", "")
-    filtered["Инфоповод"] = filtered.get("final_event_id", "")
+    event_title_map = events.set_index("event_id")["event_title"].to_dict() if len(events) else {}
+    filtered["Инфоповод"] = filtered.get("final_event_id", "").map(event_title_map).fillna("")
+    filtered["Теги"] = filtered.get("tags", "")
+    filtered["Тональность"] = filtered.get("sentiment", "")
     filtered["Ссылка"] = filtered.get("message_link", "")
-    cols = ["Дата", "Чат", "Автор", "tags", "sentiment", "Инфоповод", "Текст", "Ссылка"]
+    cols = ["Дата", "Чат", "Автор", "Теги", "Тональность", "Инфоповод", "Текст", "Ссылка"]
     cols = [c for c in cols if c in filtered.columns]
 
     st.dataframe(
@@ -598,7 +605,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.2: очищенные названия, дробление широких тем, упрощенный интерфейс")
+    st.caption("Версия 0.3: скрыты технические поля, упрощены таблицы и ручная модерация")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
