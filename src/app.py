@@ -362,8 +362,12 @@ def apply_manual_edits(
             phrases="|".join(phrases),
         )
 
+        source_event_ids = sorted({str(x) for x in group.get("event_id", pd.Series(dtype=str)).dropna().astype(str).tolist()})
+
         rows.append({
             "event_id": final_id,
+            "source_event_ids": "|".join(source_event_ids),
+            "source_event_count": len(source_event_ids),
             "event_title": event_title,
             "event_summary": event_summary,
             "main_tag": base.get("main_tag", ""),
@@ -787,6 +791,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                         st.rerun()
 
         st.markdown("#### Объединить с другим инфоповодом")
+        st.caption("Объединение переносит всю видимую тему целиком: все исходные события/волны обсуждения, которые скрыты под выбранной строкой.")
         candidates = events[events["event_id"] != event_id][["event_id", "event_title", "message_count"]].copy()
         candidates["label"] = candidates.apply(
             lambda r: f"{str(r['event_title'])[:120]} · {int(r.get('message_count', 0))} сообщ.",
@@ -797,8 +802,15 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         if st.button("Объединить", disabled=not bool(target_label)):
             target_id = candidates.loc[candidates["label"] == target_label, "event_id"].iloc[0]
             try:
-                merge_events(conn, source_event_id=event_id, target_event_id=target_id, reason=reason)
-                st.success(f"Инфоповод объединен с {target_id}.")
+                source_ids_raw = str(ev.get("source_event_ids", "") or "")
+                source_ids = [x.strip() for x in source_ids_raw.split("|") if x.strip()] or [str(event_id)]
+                merged_count = 0
+                for source_id in source_ids:
+                    if source_id == str(target_id):
+                        continue
+                    merge_events(conn, source_event_id=source_id, target_event_id=target_id, reason=reason)
+                    merged_count += 1
+                st.success(f"Инфоповоды объединены: перенесено внутренних событий/волн: {merged_count}.")
                 st.cache_data.clear()
                 st.rerun()
             except Exception as e:
@@ -999,7 +1011,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.0: добавлена загрузка CSV нового периода прямо из дашборда")
+    st.caption("Версия 1.1: исправлено ручное объединение — теперь объединяется вся видимая тема, а не один внутренний event_id")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
