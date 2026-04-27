@@ -44,6 +44,42 @@ def normalize_spaces(value: str) -> str:
     return value.strip()
 
 
+def get_text_series(df: pd.DataFrame, column: str, default: str = "", aliases: list[str] | None = None) -> pd.Series:
+    """Return a string Series with the same index as df.
+
+    pandas.DataFrame.get(..., "") returns a scalar string when a column is
+    missing. Iterating over that scalar caused empty lists in zip(...) and then
+    crashes like: Length of values (0) does not match length of index.
+
+    The helper also supports common aliases because exports from different
+    periods may have slightly different column names.
+    """
+    candidates = [column] + list(aliases or [])
+    for candidate in candidates:
+        if candidate in df.columns:
+            return df[candidate].fillna("").astype(str)
+    return pd.Series([default] * len(df), index=df.index, dtype="object")
+
+
+def pick_first_non_empty(*values: str, fallback: str = "") -> str:
+    for value in values:
+        value = normalize_spaces(value)
+        if value:
+            return value
+    return fallback
+
+
+def chat_key_from_link(link: str) -> str:
+    """Best-effort chat key from Telegram/message links when chat columns differ."""
+    link = normalize_spaces(link)
+    if not link:
+        return ""
+    match = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([^/\s]+)", link, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return re.sub(r"/\d+(?:[?#].*)?$", "", link)
+
+
 def clean_text(message: str, recognized: str) -> tuple[str, str]:
     message = normalize_spaces(message)
     recognized = normalize_spaces(recognized)
@@ -96,34 +132,79 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
     for col in df.columns:
         df[col] = df[col].fillna("").astype(str)
 
-    text_pairs = df.apply(
-        lambda r: clean_text(r.get("Сообщение", ""), r.get("Автораспознанный текст", "")),
-        axis=1,
+    # Different exports may have slightly different text/date/chat column sets.
+    # Always use Series with df.index, never scalar defaults, so new CSV periods
+    # cannot fail with length mismatch during assignment.
+    message_series = get_text_series(
+        df,
+        "Сообщение",
+        aliases=["Текст", "Текст сообщения", "Message", "message", "text"],
     )
+    recognized_series = get_text_series(
+        df,
+        "Автораспознанный текст",
+        aliases=["Распознанный текст", "OCR", "Текст с изображения", "recognized_text"],
+    )
+
+    text_pairs = [
+        clean_text(message, recognized)
+        for message, recognized in zip(message_series, recognized_series)
+    ]
     df["text_clean"] = [x[0] for x in text_pairs]
     df["text_source"] = [x[1] for x in text_pairs]
 
-    df["datetime"] = parse_datetime(df.get("Дата", pd.Series([""] * len(df))))
+    date_series = get_text_series(
+        df,
+        "Дата",
+        aliases=["Дата публикации", "Дата сообщения", "date", "datetime", "created_at"],
+    )
+    df["datetime"] = parse_datetime(date_series)
     df["date"] = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
 
     # Robust message id: prefer Id сообщения, then link, then row number.
-    if "Id сообщения" in df.columns:
-        source_id = df["Id сообщения"].where(df["Id сообщения"].str.strip() != "", df.get("Ссылка", ""))
-    else:
-        source_id = df.get("Ссылка", pd.Series([""] * len(df)))
+    id_series = get_text_series(df, "Id сообщения", aliases=["ID сообщения", "message_id", "id"])
+    link_series = get_text_series(
+        df,
+        "Ссылка",
+        aliases=["URL", "url", "message_link", "Ссылка на сообщение"],
+    )
+    source_id = id_series.where(id_series.str.strip() != "", link_series)
     df["message_id"] = [
         stable_hash(v if str(v).strip() else f"row_{i}", prefix="m_")
         for i, v in enumerate(source_id.tolist())
     ]
 
+    blog_profile = get_text_series(
+        df,
+        "Профиль блога",
+        aliases=["Профиль чата", "Ссылка на блог", "Ссылка на чат", "chat_profile", "blog_profile"],
+    )
+    blog_title = get_text_series(
+        df,
+        "Блог",
+        aliases=["Чат", "Название чата", "Канал", "Группа", "chat_title", "blog", "source_name"],
+    )
     df["chat_id"] = [
-        stable_hash(v or b or "unknown", prefix="c_")
-        for v, b in zip(df.get("Профиль блога", ""), df.get("Блог", ""))
+        stable_hash(
+            pick_first_non_empty(profile, title, chat_key_from_link(link), fallback=f"unknown_chat_{i}"),
+            prefix="c_",
+        )
+        for i, (profile, title, link) in enumerate(zip(blog_profile, blog_title, link_series))
     ]
 
+    author_profile = get_text_series(
+        df,
+        "Профиль автора",
+        aliases=["Ссылка на автора", "author_profile", "user_profile"],
+    )
+    author_name = get_text_series(
+        df,
+        "Автор",
+        aliases=["Имя автора", "Пользователь", "author", "user_name", "username"],
+    )
     df["author_id"] = [
-        stable_hash(v or a or "unknown", prefix="a_")
-        for v, a in zip(df.get("Профиль автора", ""), df.get("Автор", ""))
+        stable_hash(pick_first_non_empty(profile, author, fallback=f"unknown_author_{i}"), prefix="a_")
+        for i, (profile, author) in enumerate(zip(author_profile, author_name))
     ]
 
     tag_lists = df.apply(lambda r: row_tags(r, tag_cols), axis=1)
@@ -132,7 +213,11 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
 
     # Narrow rule-based topic used before clustering. For very short replies,
     # include a small parent-post context, but do not let parent text dominate.
-    parent_context = df.get("Текст родительского поста", "").fillna("").astype(str).str.slice(0, 300)
+    parent_context = get_text_series(
+        df,
+        "Текст родительского поста",
+        aliases=["Родительский пост", "parent_text"],
+    ).str.slice(0, 300)
     df["microtopic"] = [
         classify_microtopic((text if len(str(text)) > 45 else f"{text} {parent}"), tags)
         for text, parent, tags in zip(df["text_clean"].astype(str), parent_context, df["tags"].astype(str))
@@ -147,8 +232,10 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
     df["views"] = as_int("Просмотры")
     df["engagement"] = as_int("Вовлечённость")
 
-    df["is_negative"] = df.get("Тональность", "").astype(str).str.lower().str.contains("негатив", na=False)
-    df["is_toxic"] = df.get("Токсичность", "").astype(str).str.strip().ne("")
+    sentiment_series = get_text_series(df, "Тональность", aliases=["sentiment", "Окраска", "Тон"])
+    toxicity_series = get_text_series(df, "Токсичность", aliases=["toxicity", "toxic"])
+    df["is_negative"] = sentiment_series.str.lower().str.contains("негатив", na=False)
+    df["is_toxic"] = toxicity_series.str.strip().ne("")
 
     keep_cols = {
         "message_id": "message_id",
