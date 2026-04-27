@@ -530,12 +530,8 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     c5.metric("Важность", round(float(ev.get("importance_score", 0)), 1))
 
     tags = str(ev.get("main_tags", "")).replace("|", " · ")
-    keywords = str(ev.get("keywords", "")).replace("|", ", ")
-    phrases = str(ev.get("key_phrases", "")).replace("|", ", ")
 
     st.caption(f"Теги: {tags}")
-    if phrases or keywords:
-        st.caption(f"Ключевые сигналы: {phrases or keywords}")
 
     tab_messages, tab_all, tab_edit = st.tabs(["Ключевые сообщения", "Вся лента", "Правки"])
 
@@ -735,7 +731,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.7: убран фильтр минимума сообщений, одинаковые темы автоматически объединяются")
+    st.caption("Версия 0.8: упрощена карточка инфоповода")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
