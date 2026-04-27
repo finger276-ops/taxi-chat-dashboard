@@ -542,14 +542,46 @@ def get_selected_rows(event) -> list[int]:
             return []
 
 
-def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
+def normalize_search_query(value: str) -> str:
+    """Normalize user-entered text search query for Russian text."""
+    return re.sub(r"\s+", " ", str(value or "").lower().replace("ё", "е")).strip()
+
+
+def filter_messages_by_word(messages: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Return visible messages whose text contains the entered word or phrase."""
+    q = normalize_search_query(query)
+    if not q or "text_clean" not in messages.columns:
+        return messages.iloc[0:0].copy()
+
+    work = messages.copy()
+    if "message_hidden" in work.columns:
+        work = work[~work["message_hidden"].astype(bool)]
+
+    text = (
+        work["text_clean"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .str.replace("ё", "е", regex=False)
+    )
+    return work[text.str.contains(q, regex=False, na=False)].copy()
+
+
+def apply_filters(events: pd.DataFrame, messages: pd.DataFrame) -> tuple[pd.DataFrame, str, pd.DataFrame]:
     st.sidebar.header("Фильтры")
 
     filtered = events.copy()
+    empty_messages = messages.iloc[0:0].copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
     if filtered.empty:
-        return filtered
+        return filtered, "", empty_messages
 
-    q = st.sidebar.text_input("Поиск по теме", placeholder="например: налог, забастовка, WB")
+    word_query = st.sidebar.text_input(
+        "Слово в тексте сообщений",
+        placeholder="например: налог, коэффициент, обновление",
+        help="Фильтр ищет введенное слово или фразу именно в текстах сообщений, а не в названии темы.",
+    )
+    word_matches = filter_messages_by_word(messages, word_query) if word_query else empty_messages
+
     all_tags = sorted(set(t for tags in filtered.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
     selected_tags = st.sidebar.multiselect("Теги", all_tags)
 
@@ -571,18 +603,9 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
     if not show_hidden and "is_hidden" in filtered.columns:
         filtered = filtered[~filtered["is_hidden"].astype(bool)]
 
-    if q:
-        q_low = q.lower()
-        haystack = (
-            filtered["event_title"].fillna("").astype(str)
-            + " "
-            + filtered["event_summary"].fillna("").astype(str)
-            + " "
-            + filtered.get("keywords", pd.Series([""] * len(filtered))).fillna("").astype(str)
-            + " "
-            + filtered.get("key_phrases", pd.Series([""] * len(filtered))).fillna("").astype(str)
-        ).str.lower()
-        filtered = filtered[haystack.str.contains(q_low, regex=False, na=False)]
+    if word_query:
+        matched_event_ids = set(word_matches.get("final_event_id", pd.Series(dtype=str)).dropna().astype(str))
+        filtered = filtered[filtered["event_id"].astype(str).isin(matched_event_ids)]
 
     if selected_tags:
         filtered = filtered[
@@ -607,8 +630,7 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
             | (filtered["main_tags"].fillna("").str.contains("Забастовка|Законы", regex=True))
         ]
 
-    return filtered.sort_values(["importance_score", "message_count"], ascending=False)
-
+    return filtered.sort_values(["importance_score", "message_count"], ascending=False), word_query, word_matches
 
 def create_manual_event_form(conn, key_prefix: str = "manual_event", *, compact: bool = False) -> str | None:
     """Render a form for creating a user-defined information event."""
@@ -661,6 +683,44 @@ def show_kpis(events: pd.DataFrame):
     c3.metric("Чатов", int(events["chat_count"].max()) if len(events) else 0)
     c4.metric("Негатив", format_pct(events["negative_count"].sum() / events["message_count"].sum()) if len(events) and events["message_count"].sum() else "0%")
     c5.metric("Высокая важность", int((events["importance_score"] >= events["importance_score"].quantile(0.75)).sum()) if len(events) else 0)
+
+
+
+def word_message_results_table(messages: pd.DataFrame, events: pd.DataFrame, query: str):
+    """Show all messages that match the sidebar word filter."""
+    if not str(query or "").strip():
+        return
+
+    st.subheader(f"Сообщения со словом: «{query}»")
+
+    if messages.empty:
+        st.info("Сообщений с таким словом в тексте не найдено.")
+        return
+
+    table = messages.copy().sort_values("datetime", ascending=False)
+    table["Дата"] = format_date_series(table.get("datetime", pd.Series(dtype=str)))
+    table["Чат"] = table.get("chat_title", "")
+    table["Автор"] = table.get("author", "")
+    table["Текст"] = table.get("text_clean", "").fillna("").astype(str).str.slice(0, 500)
+    event_title_map = events.set_index("event_id")["event_title"].to_dict() if len(events) else {}
+    table["Инфоповод"] = table.get("final_event_id", "").map(event_title_map).fillna("")
+    table["Ссылка"] = table.get("message_link", "")
+
+    st.caption(f"Найдено сообщений: {len(table):,}".replace(",", " "))
+    cols = ["Дата", "Чат", "Автор", "Инфоповод", "Текст", "Ссылка"]
+    cols = [c for c in cols if c in table.columns]
+
+    st.dataframe(
+        table[cols],
+        use_container_width=True,
+        height=420,
+        hide_index=True,
+        column_config={
+            "Текст": st.column_config.TextColumn(width="large"),
+            "Инфоповод": st.column_config.TextColumn(width="medium"),
+            "Ссылка": st.column_config.LinkColumn("Ссылка"),
+        },
+    )
 
 
 def event_table(events: pd.DataFrame) -> str | None:
@@ -1166,7 +1226,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.2: добавлено ручное создание инфоповодов и перенос сообщений в новую тему")
+    st.caption("Версия 1.3: фильтр по теме заменен на поиск слова в текстах сообщений")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -1210,8 +1270,10 @@ def main():
 
     show_manual_event_creator(conn)
 
-    filtered_events = apply_filters(events)
+    filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
     show_kpis(filtered_events)
+    if word_query:
+        word_message_results_table(word_matches, events, word_query)
     selected_event_id = event_table(filtered_events)
     if selected_event_id:
         show_event_card(selected_event_id, events, enriched_messages, conn)
