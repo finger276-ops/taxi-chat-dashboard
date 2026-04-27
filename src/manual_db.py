@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 from datetime import datetime
+import uuid
 import pandas as pd
 
 
@@ -56,6 +57,18 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (event_id, message_id)
         );
 
+        CREATE TABLE IF NOT EXISTS manual_events (
+            event_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            summary TEXT,
+            status TEXT,
+            main_tags TEXT,
+            hidden INTEGER DEFAULT 0,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,
@@ -95,6 +108,38 @@ def get_message_overrides(conn: sqlite3.Connection) -> pd.DataFrame:
 
 def get_message_exclusions(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql_query("SELECT * FROM event_message_exclusions", conn)
+
+
+def get_manual_events(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM manual_events", conn)
+
+
+def create_manual_event(
+    conn: sqlite3.Connection,
+    title: str,
+    summary: str = "",
+    status: str = "новый",
+    main_tags: str = "",
+    hidden: bool = False,
+    note: str = "",
+) -> str:
+    """Create a user-defined information event and return its id."""
+    title = str(title or "").strip()
+    if not title:
+        raise ValueError("Укажите название инфоповода.")
+
+    event_id = f"manual_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    created = now()
+    conn.execute(
+        """
+        INSERT INTO manual_events(event_id, title, summary, status, main_tags, hidden, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, title, summary, status, main_tags, int(hidden), note, created, created),
+    )
+    conn.commit()
+    log(conn, "create_manual_event", "event", event_id, f"title={title}; note={note}")
+    return event_id
 
 
 def save_event_override(

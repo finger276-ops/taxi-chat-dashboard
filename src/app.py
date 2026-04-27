@@ -24,6 +24,8 @@ from manual_db import (
     get_event_merges,
     get_message_overrides,
     get_message_exclusions,
+    get_manual_events,
+    create_manual_event,
     save_event_override,
     merge_events,
     move_message,
@@ -102,6 +104,72 @@ def normalize_title_for_auto_merge(title: str) -> str:
     value = re.sub(r"\s*[—–-]\s*волна\s*\d+\s*$", "", value)
     value = value.strip(" .,:;!?'\"«»()[]{}")
     return value
+
+def normalize_manual_tags(tags: str) -> str:
+    """Return tags in the same pipe-separated format as generated events."""
+    raw = str(tags or "").replace(";", ",").replace("|", ",")
+    items = []
+    seen = set()
+    for item in raw.split(","):
+        item = re.sub(r"\s+", " ", item).strip()
+        if not item:
+            continue
+        key = item.lower().replace("ё", "е")
+        if key not in seen:
+            seen.add(key)
+            items.append(item)
+    return "|".join(items)
+
+
+def append_manual_events(events: pd.DataFrame, manual_events: pd.DataFrame) -> pd.DataFrame:
+    """Append user-created information events to the generated event table."""
+    if manual_events is None or manual_events.empty:
+        return events
+
+    events = events.copy()
+    rows = []
+    existing_ids = set(events.get("event_id", pd.Series(dtype=str)).astype(str))
+    for _, row in manual_events.iterrows():
+        event_id = str(row.get("event_id", "")).strip()
+        if not event_id or event_id in existing_ids:
+            continue
+        rows.append({
+            "event_id": event_id,
+            "event_title": str(row.get("title", "")).strip() or "Новый инфоповод",
+            "event_summary": str(row.get("summary", "")).strip(),
+            "main_tag": "ручной",
+            "main_tags": normalize_manual_tags(row.get("main_tags", "")),
+            "keywords": "",
+            "key_phrases": "",
+            "start_date": pd.NaT,
+            "end_date": pd.NaT,
+            "discussion_count": 0,
+            "message_count": 0,
+            "chat_count": 0,
+            "author_count": 0,
+            "negative_count": 0,
+            "toxic_count": 0,
+            "negative_share": 0.0,
+            "toxic_share": 0.0,
+            "importance_score": 0.0,
+            "status": str(row.get("status", "")).strip() or "новый",
+            "is_hidden": str(row.get("hidden", "0")).lower() in ["1", "true", "yes", "да"],
+            "is_manual": True,
+        })
+
+    if not rows:
+        return events
+
+    manual_df = pd.DataFrame(rows)
+    for col in events.columns:
+        if col not in manual_df.columns:
+            manual_df[col] = np.nan
+    for col in manual_df.columns:
+        if col not in events.columns:
+            events[col] = np.nan
+
+    return pd.concat([events, manual_df[events.columns]], ignore_index=True)
+
 
 
 
@@ -226,8 +294,12 @@ def build_auto_title_merge_map(events: pd.DataFrame) -> dict[str, str]:
     if events.empty or "final_event_id" not in events.columns or "event_title" not in events.columns:
         return {}
 
+    work_events = events.copy()
+    if "is_manual" in work_events.columns:
+        work_events = work_events[~work_events["is_manual"].astype(str).str.lower().isin(["true", "1", "yes", "да"])]
+
     representatives = (
-        events.groupby("final_event_id", as_index=False)
+        work_events.groupby("final_event_id", as_index=False)
         .agg(
             event_title=("event_title", "first"),
             message_count=("message_count", "sum"),
@@ -258,8 +330,9 @@ def apply_manual_edits(
     merges: pd.DataFrame,
     message_overrides: pd.DataFrame,
     message_exclusions: pd.DataFrame | None = None,
+    manual_events: pd.DataFrame | None = None,
 ):
-    events = events.copy()
+    events = append_manual_events(events.copy(), manual_events)
     links = event_discussions.copy()
     msg_links = discussion_messages.merge(links, on="discussion_id", how="left")
 
@@ -341,6 +414,9 @@ def apply_manual_edits(
         ]
 
         all_tags = sorted(set(t for tags in group.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
+        if len(group_messages) and "tags" in group_messages.columns:
+            message_tags = sorted(set(t for tags in group_messages["tags"].fillna("") for t in str(tags).split("|") if t.strip()))
+            all_tags = sorted(set(all_tags) | set(message_tags))
         keywords = sorted(set(t for tags in group.get("keywords", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
         phrases = sorted(set(t for tags in group.get("key_phrases", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
 
@@ -354,7 +430,8 @@ def apply_manual_edits(
         toxic_count = int(group_messages["is_toxic"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_toxic" in group_messages and len(group_messages) else int(group["toxic_count"].sum())
 
         event_title = str(base.get("event_title", ""))
-        event_summary = build_event_description(
+        manual_summary = str(base.get("event_summary", "") or "").strip() if str(base.get("is_manual", "")).lower() in ["true", "1", "yes", "да"] else ""
+        event_summary = manual_summary or build_event_description(
             event_title,
             "|".join(all_tags),
             group_messages,
@@ -384,7 +461,8 @@ def apply_manual_edits(
             "toxic_count": toxic_count,
             "importance_score": float(group["importance_score"].max()),
             "status": base.get("status", "новый"),
-            "is_hidden": False,
+            "is_hidden": bool(base.get("is_hidden", False)) if str(base.get("is_manual", "")).lower() in ["true", "1", "yes", "да"] else False,
+            "is_manual": str(base.get("is_manual", "")).lower() in ["true", "1", "yes", "да"],
         })
 
     visible_events = pd.DataFrame(rows)
@@ -530,6 +608,50 @@ def apply_filters(events: pd.DataFrame) -> pd.DataFrame:
         ]
 
     return filtered.sort_values(["importance_score", "message_count"], ascending=False)
+
+
+def create_manual_event_form(conn, key_prefix: str = "manual_event", *, compact: bool = False) -> str | None:
+    """Render a form for creating a user-defined information event."""
+    with st.form(f"{key_prefix}_form"):
+        title = st.text_input("Название инфоповода", placeholder="Например: Проблемы с детскими креслами")
+        summary = st.text_area(
+            "Описание",
+            placeholder="Например: В теме обсуждались: требования к детским креслам; отказы от заказов с детьми; штрафы.",
+            height=90 if compact else 130,
+        )
+        tags = st.text_input("Теги", placeholder="через запятую: Яндекс, детские кресла, тарифы")
+        status = st.selectbox(
+            "Статус",
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index("новый") if "новый" in STATUS_OPTIONS else 0,
+            key=f"{key_prefix}_status",
+        )
+        note = st.text_input("Комментарий модератора", value="", key=f"{key_prefix}_note")
+        submitted = st.form_submit_button("Создать инфоповод")
+        if submitted:
+            try:
+                new_id = create_manual_event(
+                    conn,
+                    title=title,
+                    summary=summary,
+                    status=status,
+                    main_tags=normalize_manual_tags(tags),
+                    note=note,
+                )
+                st.success("Инфоповод создан. Теперь в него можно переносить сообщения.")
+                st.cache_data.clear()
+                return new_id
+            except Exception as e:
+                st.error(str(e))
+    return None
+
+
+def show_manual_event_creator(conn):
+    with st.sidebar.expander("Создать инфоповод", expanded=False):
+        st.caption("Используйте, если нужной темы нет в списке. Новый инфоповод появится в таблице и в списке для переноса сообщений.")
+        new_id = create_manual_event_form(conn, key_prefix="sidebar_create_event", compact=True)
+        if new_id:
+            st.rerun()
 
 
 def show_kpis(events: pd.DataFrame):
@@ -730,6 +852,39 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                         st.success("Сообщение скрыто во всех разделах дашборда.")
                         st.cache_data.clear()
                         st.rerun()
+
+                    st.markdown("##### Создать новый инфоповод для этого сообщения")
+                    st.caption("Если подходящей темы нет в списке, создайте новую — выбранное сообщение сразу будет перенесено туда.")
+                    with st.form(f"create_event_for_message_{event_id}_{row['message_id']}"):
+                        new_title = st.text_input("Название новой темы", key=f"new_event_title_{event_id}_{row['message_id']}")
+                        new_summary = st.text_area(
+                            "Описание новой темы",
+                            value="",
+                            height=90,
+                            key=f"new_event_summary_{event_id}_{row['message_id']}",
+                        )
+                        new_tags = st.text_input(
+                            "Теги новой темы",
+                            value=str(row.get("tags", "")).replace("|", ", "),
+                            key=f"new_event_tags_{event_id}_{row['message_id']}",
+                        )
+                        create_and_move = st.form_submit_button("Создать и перенести сообщение")
+                        if create_and_move:
+                            try:
+                                new_event_id = create_manual_event(
+                                    conn,
+                                    title=new_title,
+                                    summary=new_summary,
+                                    status="новый",
+                                    main_tags=normalize_manual_tags(new_tags),
+                                    note=f"Создано из сообщения {row['message_id']}",
+                                )
+                                move_message(conn, row["message_id"], new_event_id, note="Перенесено в новый инфоповод")
+                                st.success("Новый инфоповод создан, сообщение перенесено.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
 
     with tab_edit:
         st.markdown("#### Ручная правка инфоповода")
@@ -1011,7 +1166,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.1: исправлено ручное объединение — теперь объединяется вся видимая тема, а не один внутренний event_id")
+    st.caption("Версия 1.2: добавлено ручное создание инфоповодов и перенос сообщений в новую тему")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -1035,6 +1190,7 @@ def main():
     merges = get_event_merges(conn)
     msg_overrides = get_message_overrides(conn)
     msg_exclusions = get_message_exclusions(conn)
+    manual_events = get_manual_events(conn)
 
     events, enriched_messages = apply_manual_edits(
         events_raw,
@@ -1045,17 +1201,20 @@ def main():
         merges,
         msg_overrides,
         msg_exclusions,
+        manual_events,
     )
 
     if page == "Поиск сообщений":
         show_message_search(enriched_messages, events, conn)
         return
 
+    show_manual_event_creator(conn)
+
     filtered_events = apply_filters(events)
     show_kpis(filtered_events)
     selected_event_id = event_table(filtered_events)
     if selected_event_id:
-        show_event_card(selected_event_id, filtered_events, enriched_messages, conn)
+        show_event_card(selected_event_id, events, enriched_messages, conn)
 
 
 if __name__ == "__main__":
