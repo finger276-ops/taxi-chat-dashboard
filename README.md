@@ -242,3 +242,21 @@ python src/preprocess.py --input data/chats.csv --output data/processed --simila
 - список инфоповодов ниже автоматически ограничивается темами, в которых есть найденные сообщения.
 
 Пример: если ввести `коэффициент`, дашборд покажет все сообщения, где это слово встречается в тексте, и только связанные с ними инфоповоды.
+
+## Версия 1.4 — постоянное хранение через Supabase
+
+Добавлено внешнее хранение периодов и ручных правок. Подробная инструкция: `README_SUPABASE.md`.
+
+Минимально нужно заменить в GitHub:
+
+```text
+src/app.py
+src/manual_db.py
+src/persistent_store.py
+requirements.txt
+sql/supabase_schema.sql
+README_SUPABASE.md
+README.md
+```
+
+После настройки Supabase дашборд будет показывать фильтр «Периоды» и сохранять загруженные CSV-периоды вне Streamlit Cloud.

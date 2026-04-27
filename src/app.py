@@ -35,6 +35,14 @@ from manual_db import (
 )
 from settings import STATUS_OPTIONS
 from preprocess import run_preprocess, run_preprocess_from_dataframe
+from persistent_store import (
+    supabase_configured,
+    list_periods,
+    load_generated_tables_from_supabase,
+    save_processed_tables_from_dir,
+    make_period_id,
+    save_uploaded_csv_to_storage,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1095,6 +1103,39 @@ def read_manifest(data_dir: Path) -> dict:
         return {}
 
 
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_generated_tables_remote(period_ids: tuple[str, ...]):
+    return load_generated_tables_from_supabase(list(period_ids))
+
+
+def render_period_selector() -> list[str]:
+    """Render Supabase period selector and return selected period IDs."""
+    periods = list_periods()
+    if periods.empty:
+        st.sidebar.info("В Supabase пока нет сохраненных периодов. Загрузите CSV в разделе «Загрузка CSV».")
+        return []
+
+    def period_label(row) -> str:
+        name = str(row.get("period_name", "") or row.get("period_id", ""))
+        date_from = format_date(row.get("date_from")) if "date_from" in row else ""
+        date_to = format_date(row.get("date_to")) if "date_to" in row else ""
+        dates = f" · {date_from}–{date_to}" if date_from or date_to else ""
+        return f"{name}{dates}"
+
+    labels = {str(row["period_id"]): period_label(row) for _, row in periods.iterrows()}
+    options = list(labels.keys())
+    default = options[:1]
+    selected = st.sidebar.multiselect(
+        "Периоды",
+        options=options,
+        default=default,
+        format_func=lambda x: labels.get(x, x),
+        help="Можно выбрать один период или несколько. При выборе нескольких периодов дашборд объединит данные.",
+    )
+    if not selected:
+        st.sidebar.warning("Выберите хотя бы один период.")
+    return selected
 def show_upload_page(data_dir: Path, upload_dir: Path):
     st.subheader("Загрузка CSV нового периода")
     st.write(
@@ -1102,11 +1143,14 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
         "Дашборд пересоберет сообщения, обсуждения и инфоповоды прямо из интерфейса."
     )
 
-    st.warning(
-        "На Streamlit Cloud загруженные файлы и пересчитанные таблицы сохраняются в текущем runtime. "
-        "После redeploy или перезапуска окружения они могут сброситься к версии из GitHub. "
-        "Для постоянного обновления данных после проверки скачайте/закоммитьте обработанные файлы или храните данные во внешней БД."
-    )
+    persistent_enabled = supabase_configured()
+    if persistent_enabled:
+        st.success("Постоянное хранение включено: CSV и обработанные периоды будут сохраняться в Supabase.")
+    else:
+        st.warning(
+            "Supabase не настроен. Загруженные файлы и пересчитанные таблицы сохранятся только в текущем runtime Streamlit Cloud "
+            "и после redeploy могут сброситься к версии из GitHub."
+        )
 
     manifest = read_manifest(data_dir)
     if manifest:
@@ -1114,6 +1158,13 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
         c1.metric("Текущих сообщений", f"{int(manifest.get('rows_messages', 0)):,}".replace(",", " "))
         c2.metric("Текущих обсуждений", f"{int(manifest.get('rows_discussions', 0)):,}".replace(",", " "))
         c3.metric("Текущих инфоповодов", f"{int(manifest.get('rows_events', 0)):,}".replace(",", " "))
+
+    default_period_name = datetime.now().strftime("%d.%m.%Y")
+    period_name = st.text_input(
+        "Название периода",
+        value=default_period_name,
+        help="Например: 24.04.2026–30.04.2026. Так период будет отображаться в фильтре.",
+    )
 
     mode = st.radio(
         "Режим загрузки",
@@ -1149,7 +1200,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
 
         try:
             with st.spinner("Читаю CSV и пересобираю инфоповоды…"):
-                if mode.startswith("Заменить"):
+                if persistent_enabled or mode.startswith("Заменить"):
                     manifest = run_preprocess(
                         input_path=saved_path,
                         output=data_dir,
@@ -1184,6 +1235,25 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
                         event_window_hours=float(event_window_hours),
                     )
 
+
+            if persistent_enabled:
+                period_title = str(period_name or uploaded.name).strip() or uploaded.name
+                period_id = make_period_id(period_title, uploaded.name)
+                with st.spinner("Сохраняю период в Supabase…"):
+                    save_processed_tables_from_dir(
+                        data_dir,
+                        period_id=period_id,
+                        period_name=period_title,
+                        source_filename=uploaded.name,
+                        manifest=manifest,
+                        replace=True,
+                    )
+                    try:
+                        save_uploaded_csv_to_storage(period_id, uploaded.name, bytes(uploaded.getbuffer()))
+                    except Exception as storage_error:
+                        st.warning(f"Обработанные данные сохранены в Supabase, но сырой CSV не удалось сохранить в Storage: {storage_error}")
+                st.success(f"Период сохранен в Supabase: {period_title}")
+
             st.cache_data.clear()
             st.success(
                 "Данные пересобраны: "
@@ -1199,22 +1269,45 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
             st.exception(e)
 
     with st.expander("История загруженных CSV", expanded=False):
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        files = sorted(upload_dir.glob("*.csv"), reverse=True)
-        if not files:
-            st.write("Пока нет загруженных CSV-файлов.")
+        if persistent_enabled:
+            try:
+                periods = list_periods()
+                if periods.empty:
+                    st.write("Пока нет сохраненных периодов в Supabase.")
+                else:
+                    view = periods.copy()
+                    for col in ["date_from", "date_to", "uploaded_at"]:
+                        if col in view.columns:
+                            view[col] = pd.to_datetime(view[col], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
+                    cols = [c for c in ["period_name", "date_from", "date_to", "source_filename", "uploaded_at", "status"] if c in view.columns]
+                    st.dataframe(view[cols].rename(columns={
+                        "period_name": "Период",
+                        "date_from": "Начало",
+                        "date_to": "Конец",
+                        "source_filename": "Файл",
+                        "uploaded_at": "Загружено",
+                        "status": "Статус",
+                    }), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.warning(f"Не удалось получить историю периодов из Supabase: {e}")
         else:
-            history = pd.DataFrame({
-                "Файл": [f.name for f in files],
-                "Размер, КБ": [round(f.stat().st_size / 1024, 1) for f in files],
-                "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
-            })
-            st.dataframe(history, use_container_width=True, hide_index=True)
-            if st.button("Очистить историю загруженных CSV"):
-                for f in files:
-                    f.unlink(missing_ok=True)
-                st.success("История загрузок очищена.")
-                st.rerun()
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            files = sorted(upload_dir.glob("*.csv"), reverse=True)
+            if not files:
+                st.write("Пока нет загруженных CSV-файлов.")
+            else:
+                history = pd.DataFrame({
+                    "Файл": [f.name for f in files],
+                    "Размер, КБ": [round(f.stat().st_size / 1024, 1) for f in files],
+                    "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
+                })
+                st.dataframe(history, use_container_width=True, hide_index=True)
+                if st.button("Очистить историю загруженных CSV"):
+                    for f in files:
+                        f.unlink(missing_ok=True)
+                    st.success("История загрузок очищена.")
+                    st.rerun()
+
 
 def main():
     args = parse_args()
@@ -1226,11 +1319,17 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.3: фильтр по теме заменен на поиск слова в текстах сообщений")
+    st.caption("Версия 1.4: добавлено постоянное хранение периодов и ручных правок в Supabase")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
     upload_dir = Path(args.upload_dir)
+    persistent_enabled = supabase_configured()
+
+    if persistent_enabled:
+        st.sidebar.success("Хранилище: Supabase")
+    else:
+        st.sidebar.info("Хранилище: локальные файлы")
 
     page = st.sidebar.radio("Раздел", ["Инфоповоды", "Поиск сообщений", "Загрузка CSV"], label_visibility="collapsed")
 
@@ -1238,14 +1337,26 @@ def main():
         show_upload_page(data_dir, upload_dir)
         return
 
-    if not data_dir.exists():
-        st.error(f"Папка с обработанными данными не найдена: {data_dir}")
-        st.info("Откройте раздел «Загрузка CSV» и загрузите исходный файл для первой сборки дашборда.")
-        st.stop()
-
     conn = connect(db_path)
 
-    events_raw, discussions, messages, discussion_messages, event_discussions = load_generated_tables(str(data_dir))
+    if persistent_enabled:
+        try:
+            selected_period_ids = render_period_selector()
+            if not selected_period_ids:
+                st.info("Пока нет выбранных периодов. Откройте «Загрузка CSV» и сохраните первый период в Supabase.")
+                st.stop()
+            events_raw, discussions, messages, discussion_messages, event_discussions = load_generated_tables_remote(tuple(selected_period_ids))
+        except Exception as e:
+            st.error("Не удалось загрузить данные из Supabase.")
+            st.exception(e)
+            st.stop()
+    else:
+        if not data_dir.exists():
+            st.error(f"Папка с обработанными данными не найдена: {data_dir}")
+            st.info("Откройте раздел «Загрузка CSV» и загрузите исходный файл для первой сборки дашборда.")
+            st.stop()
+        events_raw, discussions, messages, discussion_messages, event_discussions = load_generated_tables(str(data_dir))
+
     overrides = get_event_overrides(conn)
     merges = get_event_merges(conn)
     msg_overrides = get_message_overrides(conn)

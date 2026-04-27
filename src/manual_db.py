@@ -1,23 +1,80 @@
-"""
-SQLite layer for manual moderation actions.
+"""Manual moderation storage.
+
+Default mode: local SQLite.
+Supabase mode: if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY/SUPABASE_KEY are set,
+manual actions are persisted to the dashboard_manual_rows table in Supabase.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
+import json
 import pandas as pd
 
+from persistent_store import supabase_configured, get_supabase_client, _fetch_all
 
-def connect(db_path: str | Path) -> sqlite3.Connection:
+
+class SupabaseManualStore:
+    is_supabase = True
+
+    def __init__(self):
+        self.client = get_supabase_client()
+
+
+def connect(db_path: str | Path):
+    """Return Supabase-backed store when configured; otherwise SQLite connection."""
+    if supabase_configured():
+        return SupabaseManualStore()
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     init_db(conn)
     return conn
+
+
+def is_supabase_conn(conn) -> bool:
+    return bool(getattr(conn, "is_supabase", False))
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _payload_df(conn: SupabaseManualStore, table_name: str) -> pd.DataFrame:
+    rows = _fetch_all(conn.client, "dashboard_manual_rows", filters={"table_name": table_name})
+    payloads = []
+    for row in rows:
+        payload = row.get("payload") or {}
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return pd.DataFrame(payloads)
+
+
+def _get_payload(conn: SupabaseManualStore, table_name: str, row_key: str) -> dict:
+    response = conn.client.table("dashboard_manual_rows").select("payload").eq("row_key", row_key).limit(1).execute()
+    data = response.data or []
+    if not data:
+        return {}
+    payload = data[0].get("payload") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _upsert_payload(conn: SupabaseManualStore, table_name: str, row_key: str, payload: dict) -> None:
+    payload = {k: (None if pd.isna(v) else v) for k, v in payload.items()}
+    conn.client.table("dashboard_manual_rows").upsert({
+        "row_key": row_key,
+        "table_name": table_name,
+        "payload": payload,
+        "updated_at": now(),
+    }, on_conflict="row_key").execute()
+
+
+def _delete_payload(conn: SupabaseManualStore, row_key: str) -> None:
+    conn.client.table("dashboard_manual_rows").delete().eq("row_key", row_key).execute()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -82,11 +139,17 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
-
-
-def log(conn: sqlite3.Connection, action: str, entity_type: str, entity_id: str, payload: str = "") -> None:
+def log(conn, action: str, entity_type: str, entity_id: str, payload: str = "") -> None:
+    if is_supabase_conn(conn):
+        row_key = f"audit_log:{now()}:{uuid.uuid4().hex[:8]}"
+        _upsert_payload(conn, "audit_log", row_key, {
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "payload": payload,
+            "created_at": now(),
+        })
+        return
     conn.execute(
         "INSERT INTO audit_log(action, entity_type, entity_id, payload, created_at) VALUES (?, ?, ?, ?, ?)",
         (action, entity_type, entity_id, payload, now()),
@@ -94,28 +157,38 @@ def log(conn: sqlite3.Connection, action: str, entity_type: str, entity_id: str,
     conn.commit()
 
 
-def get_event_overrides(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_event_overrides(conn) -> pd.DataFrame:
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "event_overrides")
     return pd.read_sql_query("SELECT * FROM event_overrides", conn)
 
 
-def get_event_merges(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_event_merges(conn) -> pd.DataFrame:
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "event_merges")
     return pd.read_sql_query("SELECT * FROM event_merges", conn)
 
 
-def get_message_overrides(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_message_overrides(conn) -> pd.DataFrame:
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "message_overrides")
     return pd.read_sql_query("SELECT * FROM message_overrides", conn)
 
 
-def get_message_exclusions(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_message_exclusions(conn) -> pd.DataFrame:
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "event_message_exclusions")
     return pd.read_sql_query("SELECT * FROM event_message_exclusions", conn)
 
 
-def get_manual_events(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_manual_events(conn) -> pd.DataFrame:
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "manual_events")
     return pd.read_sql_query("SELECT * FROM manual_events", conn)
 
 
 def create_manual_event(
-    conn: sqlite3.Connection,
+    conn,
     title: str,
     summary: str = "",
     status: str = "новый",
@@ -123,13 +196,26 @@ def create_manual_event(
     hidden: bool = False,
     note: str = "",
 ) -> str:
-    """Create a user-defined information event and return its id."""
     title = str(title or "").strip()
     if not title:
         raise ValueError("Укажите название инфоповода.")
-
     event_id = f"manual_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     created = now()
+    payload = {
+        "event_id": event_id,
+        "title": title,
+        "summary": summary,
+        "status": status,
+        "main_tags": main_tags,
+        "hidden": int(hidden),
+        "note": note,
+        "created_at": created,
+        "updated_at": created,
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "manual_events", f"manual_events:{event_id}", payload)
+        log(conn, "create_manual_event", "event", event_id, f"title={title}; note={note}")
+        return event_id
     conn.execute(
         """
         INSERT INTO manual_events(event_id, title, summary, status, main_tags, hidden, note, created_at, updated_at)
@@ -143,7 +229,7 @@ def create_manual_event(
 
 
 def save_event_override(
-    conn: sqlite3.Connection,
+    conn,
     event_id: str,
     title: str | None = None,
     summary: str | None = None,
@@ -152,6 +238,23 @@ def save_event_override(
     hidden: bool | None = None,
     note: str | None = None,
 ) -> None:
+    if is_supabase_conn(conn):
+        key = f"event_overrides:{event_id}"
+        existing = _get_payload(conn, "event_overrides", key)
+        payload = {
+            "event_id": event_id,
+            "title": title if title is not None else existing.get("title"),
+            "summary": summary if summary is not None else existing.get("summary"),
+            "status": status if status is not None else existing.get("status"),
+            "priority": priority if priority is not None else existing.get("priority"),
+            "hidden": int(hidden) if hidden is not None else int(existing.get("hidden", 0) or 0),
+            "note": note if note is not None else existing.get("note"),
+            "updated_at": now(),
+        }
+        _upsert_payload(conn, "event_overrides", key, payload)
+        log(conn, "save_event_override", "event", event_id)
+        return
+
     existing = conn.execute("SELECT * FROM event_overrides WHERE event_id = ?", (event_id,)).fetchone()
     values = {
         "title": title if title is not None else (existing["title"] if existing else None),
@@ -174,24 +277,25 @@ def save_event_override(
             note=excluded.note,
             updated_at=excluded.updated_at
         """,
-        (
-            event_id,
-            values["title"],
-            values["summary"],
-            values["status"],
-            values["priority"],
-            values["hidden"],
-            values["note"],
-            now(),
-        ),
+        (event_id, values["title"], values["summary"], values["status"], values["priority"], values["hidden"], values["note"], now()),
     )
     conn.commit()
     log(conn, "save_event_override", "event", event_id)
 
 
-def merge_events(conn: sqlite3.Connection, source_event_id: str, target_event_id: str, reason: str = "") -> None:
+def merge_events(conn, source_event_id: str, target_event_id: str, reason: str = "") -> None:
     if source_event_id == target_event_id:
         raise ValueError("Нельзя объединить инфоповод сам с собой.")
+    payload = {
+        "source_event_id": source_event_id,
+        "target_event_id": target_event_id,
+        "reason": reason,
+        "updated_at": now(),
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "event_merges", f"event_merges:{source_event_id}", payload)
+        log(conn, "merge_events", "event", source_event_id, f"target={target_event_id}; reason={reason}")
+        return
     conn.execute(
         """
         INSERT INTO event_merges(source_event_id, target_event_id, reason, updated_at)
@@ -207,7 +311,20 @@ def merge_events(conn: sqlite3.Connection, source_event_id: str, target_event_id
     log(conn, "merge_events", "event", source_event_id, f"target={target_event_id}; reason={reason}")
 
 
-def move_message(conn: sqlite3.Connection, message_id: str, target_event_id: str, note: str = "") -> None:
+def move_message(conn, message_id: str, target_event_id: str, note: str = "") -> None:
+    if is_supabase_conn(conn):
+        key = f"message_overrides:{message_id}"
+        existing = _get_payload(conn, "message_overrides", key)
+        payload = {
+            "message_id": message_id,
+            "target_event_id": target_event_id,
+            "hidden": 0,
+            "note": note,
+            "updated_at": now(),
+        }
+        _upsert_payload(conn, "message_overrides", key, payload)
+        log(conn, "move_message", "message", message_id, f"target={target_event_id}; note={note}")
+        return
     conn.execute(
         """
         INSERT INTO message_overrides(message_id, target_event_id, hidden, note, updated_at)
@@ -224,7 +341,20 @@ def move_message(conn: sqlite3.Connection, message_id: str, target_event_id: str
     log(conn, "move_message", "message", message_id, f"target={target_event_id}; note={note}")
 
 
-def hide_message(conn: sqlite3.Connection, message_id: str, hidden: bool = True, note: str = "") -> None:
+def hide_message(conn, message_id: str, hidden: bool = True, note: str = "") -> None:
+    if is_supabase_conn(conn):
+        key = f"message_overrides:{message_id}"
+        existing = _get_payload(conn, "message_overrides", key)
+        payload = {
+            "message_id": message_id,
+            "target_event_id": existing.get("target_event_id"),
+            "hidden": int(hidden),
+            "note": note,
+            "updated_at": now(),
+        }
+        _upsert_payload(conn, "message_overrides", key, payload)
+        log(conn, "hide_message" if hidden else "unhide_message", "message", message_id, note)
+        return
     existing = conn.execute("SELECT * FROM message_overrides WHERE message_id = ?", (message_id,)).fetchone()
     target_event_id = existing["target_event_id"] if existing else None
     conn.execute(
@@ -241,12 +371,18 @@ def hide_message(conn: sqlite3.Connection, message_id: str, hidden: bool = True,
     conn.commit()
     log(conn, "hide_message" if hidden else "unhide_message", "message", message_id, note)
 
-def mark_message_irrelevant(conn: sqlite3.Connection, event_id: str, message_id: str, reason: str = "") -> None:
-    """Exclude a message only from the selected information event.
 
-    This does not delete or globally hide the message. It only removes the
-    message-event relationship from the dashboard aggregation.
-    """
+def mark_message_irrelevant(conn, event_id: str, message_id: str, reason: str = "") -> None:
+    payload = {
+        "event_id": event_id,
+        "message_id": message_id,
+        "reason": reason,
+        "updated_at": now(),
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "event_message_exclusions", f"event_message_exclusions:{event_id}:{message_id}", payload)
+        log(conn, "mark_message_irrelevant", "message", message_id, f"event={event_id}; reason={reason}")
+        return
     conn.execute(
         """
         INSERT INTO event_message_exclusions(event_id, message_id, reason, updated_at)
@@ -261,11 +397,11 @@ def mark_message_irrelevant(conn: sqlite3.Connection, event_id: str, message_id:
     log(conn, "mark_message_irrelevant", "message", message_id, f"event={event_id}; reason={reason}")
 
 
-def restore_message_relevance(conn: sqlite3.Connection, event_id: str, message_id: str) -> None:
-    """Return a previously excluded message back to the selected event."""
-    conn.execute(
-        "DELETE FROM event_message_exclusions WHERE event_id = ? AND message_id = ?",
-        (event_id, message_id),
-    )
+def restore_message_relevance(conn, event_id: str, message_id: str) -> None:
+    if is_supabase_conn(conn):
+        _delete_payload(conn, f"event_message_exclusions:{event_id}:{message_id}")
+        log(conn, "restore_message_relevance", "message", message_id, f"event={event_id}")
+        return
+    conn.execute("DELETE FROM event_message_exclusions WHERE event_id = ? AND message_id = ?", (event_id, message_id))
     conn.commit()
     log(conn, "restore_message_relevance", "message", message_id, f"event={event_id}")
