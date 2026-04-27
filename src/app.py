@@ -101,6 +101,119 @@ def normalize_title_for_auto_merge(title: str) -> str:
     return value
 
 
+
+
+SUMMARY_STOPWORDS = {
+    "это", "как", "что", "или", "для", "при", "про", "без", "есть", "нет", "все", "уже", "еще", "ещё",
+    "там", "тут", "они", "она", "его", "мне", "нам", "вам", "тебя", "себя", "так", "такой", "такая",
+    "если", "когда", "куда", "где", "кто", "чем", "надо", "нужно", "можно", "нельзя", "будет", "были",
+    "был", "была", "будут", "этот", "эта", "эти", "эту", "того", "тоже", "очень", "просто",
+    "сейчас", "сегодня", "вчера", "завтра", "потом", "теперь", "больше", "меньше", "через", "после",
+    "водитель", "водители", "такси", "чат", "чате", "сообщение", "сказал", "говорят", "пишут",
+    "яндекс", "yandex", "про", "таксометр", "машина", "заказ", "заказы",
+}
+
+SUMMARY_RULES = [
+    ("законопроект и новые требования к работе такси", [r"законопроект\w*", r"\bзакон\w*", r"регулирован\w*", r"требован\w*", r"минтранс", r"госдум", r"реестр", r"разрешени\w*"]),
+    ("налоги, патенты и самозанятость водителей", [r"налог\w*", r"патент\w*", r"самозанят\w*", r"нпд", r"деклараци\w*", r"фнс", r"штраф\w*"]),
+    ("повышение или снижение коэффициентов", [r"коэфф\w*", r"кэф\w*", r"повыш\w*.{0,40}коэфф\w*", r"сниз\w*.{0,40}коэфф\w*", r"вырос\w*.{0,40}коэфф\w*"]),
+    ("приоритет, тарифы и распределение заказов", [r"приоритет\w*", r"тариф\w*", r"эконом", r"комфорт", r"комисси\w*", r"раздач\w* заказ\w*", r"распределен\w* заказ\w*"]),
+    ("невозможность загрузить или установить обновление", [r"обновлен\w*", r"обновить", r"скачать", r"загруз\w*", r"установ\w*", r"верси\w*", r"апдейт"]),
+    ("сбои, ошибки и зависания приложения", [r"сбой\w*", r"ошибк\w*", r"не работает", r"завис\w*", r"вылета\w*", r"лага\w*", r"глюч\w*", r"баг\w*"]),
+    ("проблемы с заказами, отменами и назначением поездок", [r"отмен\w*", r"назнач\w*", r"принять заказ", r"заказ\w*.{0,40}не приход", r"не дает заказ", r"цепочк\w*", r"подач\w*"]),
+    ("блокировки, доступ к аккаунту и проверки", [r"блокиров\w*", r"заблок\w*", r"аккаунт\w*", r"доступ\w*", r"провер\w*", r"верификац\w*", r"фотоконтроль"]),
+    ("оплата, выплаты и удержания", [r"оплат\w*", r"выплат\w*", r"деньг\w*", r"баланс\w*", r"удерж\w*", r"перевод\w*", r"компенсац\w*"]),
+    ("забастовка, бойкот и коллективные действия", [r"забастов\w*", r"бойкот\w*", r"стачк\w*", r"не выход\w* на лини\w*", r"акци\w* протест\w*"]),
+    ("WB Такси, условия запуска и сравнение с агрегаторами", [r"wb\s*такси", r"wildberries", r"вайлдбер\w*", r"вб\s*такси", r"wb"]),
+    ("Фастен и альтернативные сервисы для водителей", [r"фастен", r"fasten", r"альтернатив\w* агрегатор\w*", r"нов\w* сервис\w*"]),
+    ("карты, адреса, геолокация и навигация", [r"карт\w*", r"адрес\w*", r"геолокац\w*", r"gps", r"навигатор", r"точк\w* подач\w*", r"маршрут\w*"]),
+    ("аэропорты, очереди и заказы из аэропорта", [r"аэропорт\w*", r"шереметьево", r"домодедово", r"внуково", r"пулково", r"очеред\w*"]),
+    ("детские кресла и требования к заказам с детьми", [r"детск\w* кресл\w*", r"кресл\w*", r"ребен\w*", r"ребён\w*", r"дет\w* тариф\w*"]),
+]
+
+
+def normalize_text_for_summary(text: str) -> str:
+    text = str(text or "").lower().replace("ё", "е")
+    text = re.sub(r"https?://\S+|t\.me/\S+", " ", text)
+    text = re.sub(r"[^а-яa-z0-9\s-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def summary_tokens(text: str) -> list[str]:
+    text = normalize_text_for_summary(text)
+    tokens = re.findall(r"[а-яa-z0-9]{3,}", text)
+    return [t for t in tokens if t not in SUMMARY_STOPWORDS and not t.isdigit()]
+
+
+def top_readable_phrases(texts, top_n: int = 5) -> list[str]:
+    """Return short readable frequent phrases as fallback details for summaries."""
+    counter: dict[str, int] = {}
+    for text in texts:
+        tokens = summary_tokens(str(text)[:2500])
+        for a, b in zip(tokens, tokens[1:]):
+            if a == b:
+                continue
+            phrase = f"{a} {b}"
+            counter[phrase] = counter.get(phrase, 0) + 1
+    ranked = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    return [p for p, c in ranked[:top_n] if c >= 2]
+
+
+def extract_summary_mentions(event_title: str, main_tags: str, event_messages: pd.DataFrame, keywords: str = "", phrases: str = "") -> list[str]:
+    """Extract user-facing thesis bullets from the most frequent signals in event messages."""
+    text_series = event_messages.get("text_clean", pd.Series(dtype=str)).dropna().astype(str)
+    if text_series.empty:
+        base = [p.strip() for p in str(phrases or "").split("|") if p.strip()]
+        base += [k.strip() for k in str(keywords or "").split("|") if k.strip()]
+        return base[:5]
+
+    full_text = "\n".join(text_series.head(350).tolist())
+    normalized = normalize_text_for_summary(full_text)
+
+    scored: list[tuple[int, str]] = []
+    for label, patterns in SUMMARY_RULES:
+        count = 0
+        for pattern in patterns:
+            count += len(re.findall(pattern, normalized, flags=re.IGNORECASE))
+        if count > 0:
+            scored.append((count, label))
+
+    title_tags = normalize_text_for_summary(f"{event_title} {main_tags}")
+    boosted = []
+    for count, label in scored:
+        boost = 2 if any(token in title_tags for token in summary_tokens(label)[:2]) else 0
+        boosted.append((count + boost, label))
+
+    mentions = [label for _, label in sorted(boosted, key=lambda x: x[0], reverse=True)]
+
+    for phrase in top_readable_phrases(text_series, top_n=5):
+        phrase = phrase.strip()
+        if phrase and all(phrase not in m for m in mentions):
+            mentions.append(phrase)
+        if len(mentions) >= 6:
+            break
+
+    clean: list[str] = []
+    seen: set[str] = set()
+    for item in mentions:
+        key = normalize_text_for_summary(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        clean.append(item)
+        if len(clean) >= 6:
+            break
+
+    return clean
+
+
+def build_event_description(event_title: str, main_tags: str, event_messages: pd.DataFrame, keywords: str = "", phrases: str = "") -> str:
+    """Build concise thesis-style summary for table/card display."""
+    mentions = extract_summary_mentions(event_title, main_tags, event_messages, keywords=keywords, phrases=phrases)
+    if not mentions:
+        return "В теме обсуждались связанные сообщения по выбранному инфоповоду."
+    return "В теме обсуждались: " + "; ".join(mentions[:6]) + "."
+
 def build_auto_title_merge_map(events: pd.DataFrame) -> dict[str, str]:
     """Map duplicate event titles to one representative event id.
 
@@ -237,10 +350,19 @@ def apply_manual_edits(
         negative_count = int(group_messages["is_negative"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_negative" in group_messages and len(group_messages) else int(group["negative_count"].sum())
         toxic_count = int(group_messages["is_toxic"].astype(str).str.lower().isin(["true", "1"]).sum()) if "is_toxic" in group_messages and len(group_messages) else int(group["toxic_count"].sum())
 
+        event_title = str(base.get("event_title", ""))
+        event_summary = build_event_description(
+            event_title,
+            "|".join(all_tags),
+            group_messages,
+            keywords="|".join(keywords),
+            phrases="|".join(phrases),
+        )
+
         rows.append({
             "event_id": final_id,
-            "event_title": base.get("event_title", ""),
-            "event_summary": base.get("event_summary", ""),
+            "event_title": event_title,
+            "event_summary": event_summary,
             "main_tag": base.get("main_tag", ""),
             "main_tags": "|".join(all_tags),
             "keywords": "|".join(keywords),
@@ -520,7 +642,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
 
     st.markdown("---")
     st.header(ev["event_title"])
-    st.write(ev.get("event_summary", ""))
+    st.info(str(ev.get("event_summary", "")))
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Сообщений", int(ev.get("message_count", 0)))
@@ -604,9 +726,10 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
 
     with tab_edit:
         st.markdown("#### Ручная правка инфоповода")
+        st.caption("Описание можно скорректировать вручную. После сохранения оно будет показываться в таблице и карточке вместо автоматического описания.")
         with st.form(f"edit_event_{event_id}"):
             title = st.text_input("Название", value=str(ev.get("event_title", "")))
-            summary = st.text_area("Описание", value=str(ev.get("event_summary", "")), height=120)
+            summary = st.text_area("Описание", value=str(ev.get("event_summary", "")), height=150, help="Например: В теме обсуждались: законопроект; повышение коэффициентов; невозможность загрузить обновление.")
             status = st.selectbox(
                 "Статус",
                 STATUS_OPTIONS,
@@ -731,7 +854,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.8: упрощена карточка инфоповода")
+    st.caption("Версия 0.9: описания сформулированы тезисно и доступны для ручной корректировки")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)

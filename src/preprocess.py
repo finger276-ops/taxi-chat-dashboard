@@ -496,22 +496,15 @@ def build_title(
 
 
 def summarize_event(group: pd.DataFrame, tag: str, keywords: list[str], phrases: list[str]) -> str:
-    start = pd.to_datetime(group["start_date"], errors="coerce").min()
-    end = pd.to_datetime(group["end_date"], errors="coerce").max()
-    start_s = start.strftime("%d.%m.%Y %H:%M") if pd.notna(start) else "неизвестно"
-    end_s = end.strftime("%d.%m.%Y %H:%M") if pd.notna(end) else "неизвестно"
-    msg_count = int(group["message_count"].sum())
-    chat_count = int(group["chat_id"].replace("", np.nan).nunique()) if "chat_id" in group else 0
-    author_count = int(group["author_count"].sum()) if "author_count" in group else 0
+    """Fallback thesis-style description for processed files.
 
-    details = phrases[:3] or keywords[:5]
-    detail_text = ", ".join(details) if details else "без устойчивых ключевых слов"
-
-    return (
-        f"Тема «{tag}» обсуждалась с {start_s} по {end_s}. "
-        f"Внутри: {msg_count} сообщений, {chat_count} чатов, {author_count} участников. "
-        f"Ключевые сигналы: {detail_text}."
-    )
+    The dashboard recalculates a richer description from the final message set,
+    but this keeps regenerated events.csv readable even outside Streamlit.
+    """
+    details = [x for x in (phrases[:4] or keywords[:6]) if str(x).strip()]
+    if details:
+        return "В теме обсуждались: " + "; ".join(details[:6]) + "."
+    return f"В теме обсуждались сообщения по направлению «{tag}»."
 
 
 def split_labels_by_fixed_time_window(
