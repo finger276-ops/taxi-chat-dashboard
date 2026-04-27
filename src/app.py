@@ -247,12 +247,28 @@ def format_pct(value) -> str:
         return "0%"
 
 
+def format_date(value) -> str:
+    """Return a user-facing date without time: DD.MM.YYYY."""
+    dt = pd.to_datetime(value, errors="coerce")
+    return dt.strftime("%d.%m.%Y") if pd.notna(dt) else ""
+
+
+def format_date_series(series: pd.Series) -> pd.Series:
+    """Format pandas datetime/string series as DD.MM.YYYY strings for display tables."""
+    return pd.to_datetime(series, errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
+
+
 def format_period(row: pd.Series) -> str:
-    start = row.get("start_date")
-    end = row.get("end_date")
-    start_s = start.strftime("%d.%m %H:%M") if pd.notna(start) else ""
-    end_s = end.strftime("%d.%m %H:%M") if pd.notna(end) else ""
-    return f"{start_s} — {end_s}" if end_s else start_s
+    start = pd.to_datetime(row.get("start_date"), errors="coerce")
+    end = pd.to_datetime(row.get("end_date"), errors="coerce")
+    start_s = format_date(start)
+    end_s = format_date(end)
+
+    if not start_s:
+        return end_s
+    if not end_s or start_s == end_s:
+        return start_s
+    return f"{start_s} — {end_s}"
 
 
 def get_selected_rows(event) -> list[int]:
@@ -423,7 +439,7 @@ def message_preview_cards(event_messages: pd.DataFrame, limit: int = 8):
     )
 
     for _, row in sample.iterrows():
-        when = row["datetime"].strftime("%d.%m.%Y %H:%M") if pd.notna(row.get("datetime")) else ""
+        when = format_date(row.get("datetime"))
         chat = row.get("chat_title", "")
         author = row.get("author", "")
         text = str(row.get("text_clean", "")).strip()
@@ -486,7 +502,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         else:
             table = event_messages.copy()
             table["Текст"] = table["text_clean"].fillna("").astype(str).str.slice(0, 300)
-            table["Дата"] = table["datetime"]
+            table["Дата"] = format_date_series(table["datetime"])
             table["Чат"] = table.get("chat_title", "")
             table["Автор"] = table.get("author", "")
             table["Тональность"] = table.get("sentiment", "")
@@ -575,7 +591,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.info("Есть записи об исключениях, но сообщения не найдены в текущей выгрузке.")
             else:
                 reason_map = event_exclusions.set_index("message_id")["reason"].to_dict()
-                excluded_messages["Дата"] = excluded_messages.get("datetime", "")
+                excluded_messages["Дата"] = format_date_series(excluded_messages.get("datetime", pd.Series(dtype=str)))
                 excluded_messages["Чат"] = excluded_messages.get("chat_title", "")
                 excluded_messages["Автор"] = excluded_messages.get("author", "")
                 excluded_messages["Причина"] = excluded_messages["message_id"].map(reason_map).fillna("")
@@ -640,7 +656,7 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
 
     filtered = filtered.sort_values("datetime", ascending=False).head(500)
     filtered["Текст"] = filtered["text_clean"].fillna("").astype(str).str.slice(0, 350)
-    filtered["Дата"] = filtered["datetime"]
+    filtered["Дата"] = format_date_series(filtered["datetime"])
     filtered["Чат"] = filtered.get("chat_title", "")
     filtered["Автор"] = filtered.get("author", "")
     event_title_map = events.set_index("event_id")["event_title"].to_dict() if len(events) else {}
@@ -673,7 +689,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.5: улучшена точность инфоповодов — микротемы, временные окна и более строгая кластеризация")
+    st.caption("Версия 0.6: даты в интерфейсе отображаются без времени в формате ДД.ММ.ГГГГ")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)

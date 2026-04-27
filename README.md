@@ -151,3 +151,10 @@ python src/preprocess.py --input data/chats.csv --output data/processed --simila
 ```bash
 python src/preprocess.py --input data/chats.csv --output data/processed --similarity-threshold 0.34 --event-gap-hours 2 --event-window-hours 12
 ```
+
+
+## Версия 0.6 — формат даты в интерфейсе
+
+В пользовательских таблицах дата отображается без времени в формате `ДД.ММ.ГГГГ`.
+
+Внутри данных поля `datetime`, `start_date` и `end_date` остаются полноценными датами со временем, чтобы не ломать сортировку, группировку и алгоритмы инфоповодов.
