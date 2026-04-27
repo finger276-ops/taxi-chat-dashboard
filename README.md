@@ -122,3 +122,32 @@ python src/preprocess.py --input data/chats.csv --output data/processed --window
 Во вкладке **Правки** появился блок **Нерелевантные сообщения**. Там можно посмотреть исключенные сообщения и вернуть их обратно в инфоповод.
 
 Ручные исключения хранятся в SQLite-таблице `event_message_exclusions`.
+
+
+## Версия 0.5 — более точное определение инфоповодов
+
+В этой версии изменен алгоритм группировки:
+
+- комментарии под одним родительским постом больше не склеиваются автоматически в одно обсуждение; крупные ветки дополнительно режутся по времени, тегам и микротеме;
+- перед кластеризацией каждому сообщению и обсуждению назначается `microtopic`: `coeff_priority`, `app_bug`, `tax_law`, `wb_launch`, `fasten_service`, `payments`, `account_block`, `gps_map` и т.д.;
+- кластеризация идет не по всем сообщениям сразу, а внутри узких корзин: основной тег + микротема + временное окно;
+- широкие темы вроде «яндекс» и «Коэффициент» используют более строгий порог похожести;
+- родительский пост добавляется в текст обсуждения только как короткий контекст, чтобы он не склеивал разные комментарии в один инфоповод.
+
+Рекомендуемая команда пересборки данных:
+
+```bash
+python src/preprocess.py --input data/chats.csv --output data/processed --window-minutes 60 --cluster-method tfidf --similarity-threshold 0.28 --event-gap-hours 3 --event-window-hours 16
+```
+
+Если инфоповодов слишком много, уменьши точность и сделай темы крупнее:
+
+```bash
+python src/preprocess.py --input data/chats.csv --output data/processed --similarity-threshold 0.25 --event-gap-hours 4 --event-window-hours 24
+```
+
+Если в одном инфоповоде снова появляются лишние сообщения, сделай темы строже:
+
+```bash
+python src/preprocess.py --input data/chats.csv --output data/processed --similarity-threshold 0.34 --event-gap-hours 2 --event-window-hours 12
+```

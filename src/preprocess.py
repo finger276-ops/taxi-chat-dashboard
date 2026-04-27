@@ -26,6 +26,7 @@ from settings import (
     KEYWORD_STOPWORDS,
     CRITICAL_TAG_WEIGHTS,
     TITLE_RULES,
+    MICROTOPIC_TITLES,
 )
 from io_utils import read_source_csv, write_table, write_manifest
 
@@ -129,6 +130,14 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
     df["tags"] = ["|".join(tags) for tags in tag_lists]
     df["tag_count"] = [len(tags) for tags in tag_lists]
 
+    # Narrow rule-based topic used before clustering. For very short replies,
+    # include a small parent-post context, but do not let parent text dominate.
+    parent_context = df.get("Текст родительского поста", "").fillna("").astype(str).str.slice(0, 300)
+    df["microtopic"] = [
+        classify_microtopic((text if len(str(text)) > 45 else f"{text} {parent}"), tags)
+        for text, parent, tags in zip(df["text_clean"].astype(str), parent_context, df["tags"].astype(str))
+    ]
+
     def as_int(col_name: str) -> pd.Series:
         if col_name not in df.columns:
             return pd.Series([0] * len(df), index=df.index)
@@ -177,6 +186,7 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
         "engagement": "engagement",
         "tags": "tags",
         "tag_count": "tag_count",
+        "microtopic": "microtopic",
         "is_negative": "is_negative",
         "is_toxic": "is_toxic",
     }
@@ -205,6 +215,70 @@ def tag_signature(value: str) -> str:
     return "|".join(sorted(tag_set(value)))
 
 
+def regex_any(text: str, patterns: Iterable[str]) -> bool:
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def classify_microtopic(text: str, tags: str | Iterable[str] = "") -> str:
+    """
+    Rule-based microtopic layer.
+
+    Why it exists: broad tags like «яндекс» or «Коэффициент» are too coarse.
+    Before semantic/lexical clustering, we first assign every message/discussion
+    to a narrower microtopic and only then allow clustering inside that bucket.
+    This reduces unrelated messages inside one information event.
+    """
+    t = normalize_spaces(text).lower().replace("ё", "е")
+    if isinstance(tags, str):
+        tag_values = tag_set(tags)
+    else:
+        tag_values = {str(x).strip() for x in tags if str(x).strip()}
+
+    # Critical and highly specific topics first.
+    if "Забастовка" in tag_values or regex_any(t, [r"\bзабастов\w*", r"\bбойкот\w*", r"\bстачк\w*", r"\bмитинг\w*", r"коллективн\w+\s+акци"]):
+        return "strike"
+    if "WB Такси" in tag_values or regex_any(t, [r"\bwb\b", r"wildberries", r"\bвб\b", r"валбер", r"вайлдбер"]):
+        return "wb_launch"
+    if "Фастен" in tag_values or regex_any(t, [r"fasten", r"фаст[еэо]н", r"фастон"]):
+        return "fasten_service"
+    if "Законы и налоги" in tag_values or regex_any(t, [r"налог\w*", r"патент\w*", r"самозанят\w*", r"минтранс", r"реестр\w*", r"закон\w*", r"разрешени\w*", r"лиценз\w*", r"штраф\w*", r"провер\w*"]):
+        return "tax_law"
+
+    # Product/app operational issues.
+    if regex_any(t, [r"не\s+работа\w*", r"не\s+открыва\w*", r"не\s+груз\w*", r"не\s+заход\w*", r"завис\w*", r"висит", r"сбой\w*", r"ошибк\w*", r"глюк\w*", r"вылета\w*", r"приложени\w*", r"яндекс\s+про"]):
+        if regex_any(t, [r"нет\s+заказ\w*", r"заказ\w*\s+не\s+приход", r"пропал\w*\s+заказ", r"заказ\w*\s+пропал", r"распределени\w*\s+заказ"]):
+            return "app_orders"
+        return "app_bug"
+
+    # Money and account issues.
+    if regex_any(t, [r"оплат\w*", r"выплат\w*", r"деньг\w*", r"перевод\w*", r"задолж\w*", r"баланс\w*", r"комисс\w*"]):
+        return "payments"
+    if regex_any(t, [r"блокир\w*", r"заблок\w*", r"\bбан\b", r"аккаунт\w*", r"доступ\w*", r"деактив\w*", r"профил\w*", r"самозанят\w*\s+не\s+подтверж"]):
+        return "account_block"
+
+    # Operational subtopics.
+    if regex_any(t, [r"кресл\w*", r"детск\w+", r"ребен\w*", r"ребенк\w*", r"бустер\w*"]):
+        return "child_seat"
+    if "Коэффициент" in tag_values or regex_any(t, [r"коэф\w*", r"коэффициент\w*", r"\bкэф\w*", r"приоритет\w*", r"тариф\w*", r"ценник\w*", r"стоимост\w*", r"подач\w*", r"комфорт", r"эконом"]):
+        return "coeff_priority"
+    if regex_any(t, [r"аэропорт\w*", r"пулково", r"шереметьево", r"внуково", r"домодедово"]):
+        return "airport"
+    if regex_any(t, [r"карт\w*", r"навигатор\w*", r"адрес\w*", r"геолокац\w*", r"локац\w*", r"подъезд\w*", r"maps", r"улиц\w*", r"маршрут\w*"]):
+        return "gps_map"
+    if regex_any(t, [r"поддержк\w*", r"диспетчер\w*", r"парк\w*", r"таксопарк\w*", r"оператор\w*"]):
+        return "support"
+
+    if "яндекс" in tag_values or regex_any(t, [r"яндекс", r"\bяши\b", r"\bяше\b", r"\bяшу\b", r"yandex"]):
+        return "general_yandex"
+    return "other"
+
+
+def topic_bucket_for(row: pd.Series) -> str:
+    tag = main_tag([row.get("main_tags", row.get("tags", ""))])
+    microtopic = str(row.get("microtopic", "other") or "other")
+    return f"{tag}::{microtopic}"
+
+
 def should_start_new_discussion(prev_row: pd.Series, row: pd.Series, window_minutes: int) -> bool:
     if pd.isna(prev_row["datetime"]) or pd.isna(row["datetime"]):
         return False
@@ -213,9 +287,14 @@ def should_start_new_discussion(prev_row: pd.Series, row: pd.Series, window_minu
     if gap > pd.Timedelta(minutes=window_minutes):
         return True
 
+    prev_micro = str(prev_row.get("microtopic", "other") or "other")
+    curr_micro = str(row.get("microtopic", "other") or "other")
+    if prev_micro != curr_micro and gap > pd.Timedelta(minutes=12):
+        return True
+
     prev_tags = tag_set(prev_row.get("tags", ""))
     curr_tags = tag_set(row.get("tags", ""))
-    if prev_tags and curr_tags and not (prev_tags & curr_tags) and gap > pd.Timedelta(minutes=10):
+    if prev_tags and curr_tags and not (prev_tags & curr_tags) and gap > pd.Timedelta(minutes=8):
         return True
 
     return False
@@ -229,14 +308,20 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
 
     discussion_links = []
 
-    # 1) Use parent post links as hard discussion anchors.
+    # 1) Parent post is a useful anchor, but comments under one post often drift
+    # into several sub-discussions. Split large parent threads by time, tags and microtopic.
     has_parent = messages["parent_link"].ne("")
-    for parent_link, group in messages[has_parent].groupby("parent_link", sort=False):
-        did = stable_hash(parent_link, prefix="d_parent_")
-        for mid in group["message_id"]:
-            discussion_links.append({"discussion_id": did, "message_id": mid, "discussion_source": "parent_link"})
+    for parent_link, group in messages[has_parent].sort_values(["parent_link", "sort_date", "message_id"]).groupby("parent_link", sort=False):
+        current_no = 0
+        prev = None
+        for _, row in group.iterrows():
+            if prev is None or should_start_new_discussion(prev, row, max(25, window_minutes // 2)):
+                current_no += 1
+            did = stable_hash(f"{parent_link}::{current_no:04d}", prefix="d_parent_")
+            discussion_links.append({"discussion_id": did, "message_id": row["message_id"], "discussion_source": "parent_link_segment"})
+            prev = row
 
-    # 2) For messages without parent, segment by chat, time and tag overlap.
+    # 2) For messages without parent, segment by chat, time, tag overlap and microtopic.
     no_parent = messages[~has_parent].sort_values(["chat_id", "sort_date", "message_id"]).copy()
     for chat_id, group in no_parent.groupby("chat_id", sort=False):
         current_no = 0
@@ -262,9 +347,17 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
         parent_texts = [normalize_spaces(x) for x in group.get("parent_text", pd.Series([], dtype=str)).fillna("").astype(str).unique() if normalize_spaces(x)]
         message_texts = [normalize_spaces(x) for x in group["text_clean"].fillna("").astype(str).tolist() if normalize_spaces(x)]
 
-        parent_block = "\n".join(parent_texts[:2])
+        # Message text should dominate. Parent text is only a compact context; otherwise
+        # comments under the same parent post become artificially too similar.
+        parent_block = "\n".join(parent_texts[:1])[:350]
         messages_block = "\n".join(message_texts[:80])
-        discussion_text = normalize_spaces((parent_block + "\n" + messages_block).strip())
+        if len(messages_block) < 120 and parent_block:
+            discussion_text = normalize_spaces((messages_block + "\n" + parent_block).strip())
+        else:
+            discussion_text = normalize_spaces((messages_block + "\n" + parent_block[:180]).strip())
+
+        microtopic_counts = Counter(group.get("microtopic", pd.Series(["other"])).fillna("other").astype(str))
+        microtopic = microtopic_counts.most_common(1)[0][0] if microtopic_counts else "other"
 
         rep_messages = []
         for _, r in group.head(5).iterrows():
@@ -281,6 +374,8 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
             "chat_title": group["chat_title"].iloc[0] if "chat_title" in group else "",
             "parent_link": group["parent_link"].iloc[0] if "parent_link" in group else "",
             "main_tags": "|".join(tags),
+            "microtopic": microtopic,
+            "topic_bucket": main_tag(["|".join(tags)]) + "::" + microtopic,
             "message_count": int(group["message_id"].nunique()),
             "author_count": int(group["author_id"].nunique()) if "author_id" in group else 0,
             "negative_count": int(group["is_negative"].astype(bool).sum()) if "is_negative" in group else 0,
@@ -311,7 +406,7 @@ def top_keywords(texts: Iterable[str], top_n: int = 7) -> list[str]:
     """
     counter: Counter[str] = Counter()
     for text in texts:
-        counter.update(tokenize_ru(text, for_keywords=True))
+        counter.update(tokenize_ru(str(text)[:3500], for_keywords=True))
     return [w for w, _ in counter.most_common(top_n)]
 
 
@@ -322,7 +417,7 @@ def top_phrases(texts: Iterable[str], top_n: int = 5) -> list[str]:
     """
     counter: Counter[str] = Counter()
     for text in texts:
-        tokens = tokenize_ru(text, for_keywords=True)
+        tokens = tokenize_ru(str(text)[:3500], for_keywords=True)
         for a, b in zip(tokens, tokens[1:]):
             if a != b:
                 counter[f"{a} {b}"] += 1
@@ -351,9 +446,23 @@ def tag_set_from_series(tags_series: Iterable[str]) -> set[str]:
     return result
 
 
-def build_title(tag: str, keywords: list[str], all_tags: Iterable[str] | None = None) -> str:
+def build_title(
+    tag: str,
+    keywords: list[str],
+    all_tags: Iterable[str] | None = None,
+    microtopic: str = "other",
+    phrases: list[str] | None = None,
+) -> str:
     all_tags = set(all_tags or [])
     kw = set(keywords)
+    phrases = phrases or []
+
+    # Microtopic is more precise than a broad tag. Prefer it when available.
+    if microtopic in MICROTOPIC_TITLES and microtopic != "other":
+        # Keep the title stable and clean. Specific clues are shown in the
+        # summary/keywords, not injected into the title where noisy OCR/chat words
+        # can make the table look unreliable.
+        return MICROTOPIC_TITLES[microtopic]
 
     for rule in TITLE_RULES:
         if all_tags & set(rule.get("tags", set())) and (not rule.get("keywords") or kw & set(rule.get("keywords", set()))):
@@ -438,61 +547,123 @@ def split_labels_by_fixed_time_window(
         result.loc[idx] = mapping[key]
     return result.astype(int)
 
-def cluster_discussions_tfidf(
-    discussions: pd.DataFrame,
-    similarity_threshold: float = 0.25,
-    max_features: int = 6000,
+def dynamic_threshold(bucket: str, base: float) -> float:
+    """Stricter threshold for broad/noisy buckets."""
+    if "general_yandex" in bucket or bucket.endswith("::other"):
+        return min(0.72, base + 0.12)
+    if "coeff_priority" in bucket:
+        return min(0.68, base + 0.07)
+    if "app_bug" in bucket or "app_orders" in bucket:
+        return min(0.66, base + 0.05)
+    return base
+
+
+def cluster_sparse_greedy(
+    group: pd.DataFrame,
+    threshold: float,
+    max_gap_hours: float,
+    max_event_span_hours: float,
+    max_features: int,
 ) -> pd.Series:
+    """
+    Fast clustering inside a narrow topic+time bucket.
+
+    We still use connected components, but only after splitting by microtopic and
+    fixed time bucket. This removes the worst source of false merges: long chains
+    across broad tags over several days.
+    """
     from scipy.sparse.csgraph import connected_components
     from sklearn.feature_extraction.text import TfidfVectorizer
 
-    texts = discussions["discussion_text"].fillna("").astype(str).tolist()
-    if len(texts) == 0:
+    if len(group) == 0:
         return pd.Series([], dtype=int)
+    if len(group) == 1:
+        return pd.Series([0], index=group.index, dtype=int)
 
-    if len(texts) == 1:
-        return pd.Series([0], index=discussions.index)
-
+    texts = group["discussion_text"].fillna("").astype(str).tolist()
+    min_df = 1 if len(group) < 12 else 2
     vectorizer = TfidfVectorizer(
         tokenizer=tokenize_ru,
         token_pattern=None,
         ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.60,
+        min_df=min_df,
+        max_df=0.72,
         max_features=max_features,
         sublinear_tf=True,
     )
     try:
         X = vectorizer.fit_transform(texts)
     except ValueError:
-        # If the subset is too small for min_df=2, fall back to singleton clusters.
-        return pd.Series(range(len(discussions)), index=discussions.index, dtype=int)
+        return pd.Series(range(len(group)), index=group.index, dtype=int)
 
     nonzero_mask = np.asarray(X.getnnz(axis=1) > 0).ravel()
-
-    # Zero-vector rows have no useful lexical signal; make them singleton clusters.
-    result = pd.Series(index=discussions.index, dtype=int)
-
+    result = pd.Series(index=group.index, dtype=int)
     if int(nonzero_mask.sum()) < 2:
-        result.loc[:] = range(len(discussions))
+        result.loc[:] = range(len(group))
         return result.astype(int)
 
     Xn = X[nonzero_mask]
-
-    # TF-IDF is L2-normalized by default, so dot product equals cosine similarity.
-    # Build a sparse similarity graph and use connected components as clusters.
     sim = Xn @ Xn.T
     sim.setdiag(0)
-    sim.data[sim.data < similarity_threshold] = 0
+    sim.data[sim.data < threshold] = 0
     sim.eliminate_zeros()
 
-    n_components, labels = connected_components(sim, directed=False, return_labels=True)
+    _, labels = connected_components(sim, directed=False, return_labels=True)
     result.iloc[np.where(nonzero_mask)[0]] = labels
 
     next_label = int(labels.max()) + 1 if len(labels) else 0
     for pos in np.where(~nonzero_mask)[0]:
         result.iloc[pos] = next_label
         next_label += 1
+
+    return result.astype(int)
+
+
+def cluster_discussions_tfidf(
+    discussions: pd.DataFrame,
+    similarity_threshold: float = 0.38,
+    max_features: int = 6000,
+    max_gap_hours: float = 0.75,
+    max_event_span_hours: float = 8.0,
+) -> pd.Series:
+    texts = discussions["discussion_text"].fillna("").astype(str)
+    if len(texts) == 0:
+        return pd.Series([], dtype=int)
+    if len(texts) == 1:
+        return pd.Series([0], index=discussions.index)
+
+    d = discussions.copy()
+    if "topic_bucket" not in d.columns:
+        d["topic_bucket"] = d.apply(topic_bucket_for, axis=1)
+
+    # Narrow time bucket before lexical clustering. This is the main protection
+    # against putting several independent waves into one information event.
+    d["_start"] = pd.to_datetime(d["start_date"], errors="coerce")
+    fallback = pd.Timestamp("1970-01-01")
+    bucket_hours = max(1.0, float(max_event_span_hours))
+    d["_time_bucket"] = (
+        d["_start"].fillna(fallback).astype("int64")
+        // int(pd.Timedelta(hours=bucket_hours).value)
+    )
+    d["_cluster_bucket"] = d["topic_bucket"].astype(str) + "::t" + d["_time_bucket"].astype(str)
+
+    result = pd.Series(index=d.index, dtype=int)
+    next_label = 0
+
+    # Cluster independently inside narrow topic + time buckets.
+    for bucket, group in d.groupby("_cluster_bucket", sort=False):
+        topic_part = str(group["topic_bucket"].iloc[0]) if len(group) else str(bucket)
+        bucket_threshold = dynamic_threshold(topic_part, similarity_threshold)
+        local_labels = cluster_sparse_greedy(
+            group,
+            threshold=bucket_threshold,
+            max_gap_hours=max_gap_hours,
+            max_event_span_hours=max_event_span_hours,
+            max_features=max_features,
+        )
+        unique_local = {int(v): i + next_label for i, v in enumerate(sorted(local_labels.unique()))}
+        result.loc[group.index] = local_labels.map(unique_local)
+        next_label += len(unique_local)
 
     return result.astype(int)
 
@@ -606,6 +777,8 @@ def make_events(
         tag = main_tag(group["main_tags"])
         keywords = top_keywords(group["discussion_text"].fillna("").astype(str), top_n=7)
         phrases = top_phrases(group["discussion_text"].fillna("").astype(str), top_n=5)
+        microtopic_counter = Counter(group.get("microtopic", pd.Series(["other"])).fillna("other").astype(str))
+        microtopic = microtopic_counter.most_common(1)[0][0] if microtopic_counter else "other"
 
         start = pd.to_datetime(group["start_date"], errors="coerce").min()
         end = pd.to_datetime(group["end_date"], errors="coerce").max()
@@ -632,9 +805,10 @@ def make_events(
 
         rows.append({
             "event_id": event_id,
-            "event_title": build_title(tag, keywords, all_tags),
-            "event_summary": summarize_event(group, tag, keywords, phrases),
+            "event_title": build_title(tag, keywords, all_tags, microtopic=microtopic, phrases=phrases),
+            "event_summary": summarize_event(group, MICROTOPIC_TITLES.get(microtopic, tag), keywords, phrases),
             "main_tag": tag,
+            "microtopic": microtopic,
             "main_tags": "|".join(all_tags),
             "keywords": "|".join(keywords),
             "key_phrases": "|".join(phrases),
@@ -663,9 +837,9 @@ def main() -> None:
     parser.add_argument("--output", default="data/processed", help="Output directory")
     parser.add_argument("--window-minutes", type=int, default=60)
     parser.add_argument("--cluster-method", choices=["tfidf", "embeddings", "none"], default="tfidf")
-    parser.add_argument("--similarity-threshold", type=float, default=0.25)
-    parser.add_argument("--event-gap-hours", type=float, default=1.0, help="Split clusters into separate events when the time gap is larger than this value")
-    parser.add_argument("--event-window-hours", type=float, default=12.0, help="Additionally split broad clusters into fixed time windows")
+    parser.add_argument("--similarity-threshold", type=float, default=0.28)
+    parser.add_argument("--event-gap-hours", type=float, default=3.0, help="Split clusters into separate events when the time gap is larger than this value")
+    parser.add_argument("--event-window-hours", type=float, default=16.0, help="Additionally limit one event to a fixed time span")
     parser.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     args = parser.parse_args()
 
@@ -694,6 +868,8 @@ def main() -> None:
         labels = cluster_discussions_tfidf(
             clusterable,
             similarity_threshold=args.similarity_threshold,
+            max_gap_hours=args.event_gap_hours,
+            max_event_span_hours=args.event_window_hours,
         )
 
     if len(clusterable):
