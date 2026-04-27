@@ -48,6 +48,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS event_message_exclusions (
+            event_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            reason TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (event_id, message_id)
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,
@@ -83,6 +91,10 @@ def get_event_merges(conn: sqlite3.Connection) -> pd.DataFrame:
 
 def get_message_overrides(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql_query("SELECT * FROM message_overrides", conn)
+
+
+def get_message_exclusions(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query("SELECT * FROM event_message_exclusions", conn)
 
 
 def save_event_override(
@@ -183,3 +195,32 @@ def hide_message(conn: sqlite3.Connection, message_id: str, hidden: bool = True,
     )
     conn.commit()
     log(conn, "hide_message" if hidden else "unhide_message", "message", message_id, note)
+
+def mark_message_irrelevant(conn: sqlite3.Connection, event_id: str, message_id: str, reason: str = "") -> None:
+    """Exclude a message only from the selected information event.
+
+    This does not delete or globally hide the message. It only removes the
+    message-event relationship from the dashboard aggregation.
+    """
+    conn.execute(
+        """
+        INSERT INTO event_message_exclusions(event_id, message_id, reason, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(event_id, message_id) DO UPDATE SET
+            reason=excluded.reason,
+            updated_at=excluded.updated_at
+        """,
+        (event_id, message_id, reason, now()),
+    )
+    conn.commit()
+    log(conn, "mark_message_irrelevant", "message", message_id, f"event={event_id}; reason={reason}")
+
+
+def restore_message_relevance(conn: sqlite3.Connection, event_id: str, message_id: str) -> None:
+    """Return a previously excluded message back to the selected event."""
+    conn.execute(
+        "DELETE FROM event_message_exclusions WHERE event_id = ? AND message_id = ?",
+        (event_id, message_id),
+    )
+    conn.commit()
+    log(conn, "restore_message_relevance", "message", message_id, f"event={event_id}")

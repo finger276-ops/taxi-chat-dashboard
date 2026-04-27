@@ -21,10 +21,13 @@ from manual_db import (
     get_event_overrides,
     get_event_merges,
     get_message_overrides,
+    get_message_exclusions,
     save_event_override,
     merge_events,
     move_message,
     hide_message,
+    mark_message_irrelevant,
+    restore_message_relevance,
 )
 from settings import STATUS_OPTIONS
 
@@ -96,6 +99,7 @@ def apply_manual_edits(
     overrides: pd.DataFrame,
     merges: pd.DataFrame,
     message_overrides: pd.DataFrame,
+    message_exclusions: pd.DataFrame | None = None,
 ):
     events = events.copy()
     links = event_discussions.copy()
@@ -120,6 +124,22 @@ def apply_manual_edits(
                 lambda r: move_map.get(r["message_id"], r["event_id"]),
                 axis=1,
             )
+
+    if message_exclusions is not None and not message_exclusions.empty and len(msg_links):
+        exclusions = message_exclusions.copy()
+        exclusions["event_id"] = exclusions["event_id"].apply(lambda x: merge_map.get(x, x))
+        excluded_pairs = set(
+            zip(
+                exclusions["message_id"].astype(str),
+                exclusions["event_id"].astype(str),
+            )
+        )
+        msg_links = msg_links[
+            ~msg_links.apply(
+                lambda r: (str(r.get("message_id", "")), str(r.get("event_id", ""))) in excluded_pairs,
+                axis=1,
+            )
+        ]
 
     msg_event = (
         msg_links[["message_id", "event_id"]]
@@ -492,7 +512,11 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 row = table.iloc[rows[0]]
                 st.markdown("#### Полный текст")
                 st.write(row.get("text_clean", ""))
-                with st.expander("Перенести или скрыть это сообщение", expanded=False):
+                with st.expander("Перенести, исключить или скрыть сообщение", expanded=False):
+                    st.caption(
+                        "«Нерелевант» убирает сообщение только из текущего инфоповода. "
+                        "Сообщение остается в базе и поиске."
+                    )
                     target_options = events[["event_id", "event_title", "message_count"]].copy()
                     target_options["label"] = target_options.apply(
                         lambda r: f"{str(r['event_title'])[:110]} · {int(r.get('message_count', 0))} сообщ.",
@@ -501,17 +525,22 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                     current_matches = target_options.index[target_options["event_id"] == event_id].tolist()
                     current_idx = int(current_matches[0]) if current_matches else 0
                     target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
-                    msg_note = st.text_input("Комментарий", value="")
-                    col_a, col_b = st.columns(2)
-                    if col_a.button("Перенести сообщение"):
+                    msg_note = st.text_input("Комментарий", value="", key=f"msg_note_{event_id}_{row['message_id']}")
+                    col_a, col_b, col_c = st.columns(3)
+                    if col_a.button("Перенести", key=f"move_{event_id}_{row['message_id']}"):
                         target_id = target_options.loc[target_options["label"] == target_label, "event_id"].iloc[0]
                         move_message(conn, row["message_id"], target_id, note=msg_note)
                         st.success("Сообщение перенесено.")
                         st.cache_data.clear()
                         st.rerun()
-                    if col_b.button("Скрыть сообщение"):
+                    if col_b.button("Нерелевант", key=f"irrelevant_{event_id}_{row['message_id']}"):
+                        mark_message_irrelevant(conn, event_id, row["message_id"], reason=msg_note)
+                        st.success("Сообщение исключено из текущего инфоповода как нерелевантное.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    if col_c.button("Скрыть везде", key=f"hide_{event_id}_{row['message_id']}"):
                         hide_message(conn, row["message_id"], hidden=True, note=msg_note)
-                        st.success("Сообщение скрыто.")
+                        st.success("Сообщение скрыто во всех разделах дашборда.")
                         st.cache_data.clear()
                         st.rerun()
 
@@ -533,6 +562,45 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.success("Правки сохранены.")
                 st.cache_data.clear()
                 st.rerun()
+
+        st.markdown("#### Нерелевантные сообщения")
+        exclusions = get_message_exclusions(conn)
+        event_exclusions = exclusions[exclusions["event_id"] == event_id] if not exclusions.empty else exclusions
+        if event_exclusions.empty:
+            st.info("Для этого инфоповода пока нет сообщений, помеченных как нерелевантные.")
+        else:
+            excluded_ids = event_exclusions["message_id"].astype(str).tolist()
+            excluded_messages = messages[messages["message_id"].astype(str).isin(excluded_ids)].copy()
+            if excluded_messages.empty:
+                st.info("Есть записи об исключениях, но сообщения не найдены в текущей выгрузке.")
+            else:
+                reason_map = event_exclusions.set_index("message_id")["reason"].to_dict()
+                excluded_messages["Дата"] = excluded_messages.get("datetime", "")
+                excluded_messages["Чат"] = excluded_messages.get("chat_title", "")
+                excluded_messages["Автор"] = excluded_messages.get("author", "")
+                excluded_messages["Причина"] = excluded_messages["message_id"].map(reason_map).fillna("")
+                excluded_messages["Текст"] = excluded_messages["text_clean"].fillna("").astype(str).str.slice(0, 350)
+                excluded_cols = ["Дата", "Чат", "Автор", "Причина", "Текст"]
+                excluded_select = st.dataframe(
+                    excluded_messages[excluded_cols],
+                    use_container_width=True,
+                    height=220,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    column_config={
+                        "Текст": st.column_config.TextColumn(width="large"),
+                    },
+                )
+                excluded_rows = get_selected_rows(excluded_select)
+                if excluded_rows:
+                    restored_row = excluded_messages.iloc[excluded_rows[0]]
+                    st.write(restored_row.get("text_clean", ""))
+                    if st.button("Вернуть сообщение в инфоповод", key=f"restore_{event_id}_{restored_row['message_id']}"):
+                        restore_message_relevance(conn, event_id, restored_row["message_id"])
+                        st.success("Сообщение возвращено в инфоповод.")
+                        st.cache_data.clear()
+                        st.rerun()
 
         st.markdown("#### Объединить с другим инфоповодом")
         candidates = events[events["event_id"] != event_id][["event_id", "event_title", "message_count"]].copy()
@@ -605,7 +673,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 0.3: скрыты технические поля, упрощены таблицы и ручная модерация")
+    st.caption("Версия 0.4: добавлена отметка «нерелевант» для сообщений внутри инфоповода")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -620,6 +688,7 @@ def main():
     overrides = get_event_overrides(conn)
     merges = get_event_merges(conn)
     msg_overrides = get_message_overrides(conn)
+    msg_exclusions = get_message_exclusions(conn)
 
     events, enriched_messages = apply_manual_edits(
         events_raw,
@@ -629,6 +698,7 @@ def main():
         overrides,
         merges,
         msg_overrides,
+        msg_exclusions,
     )
 
     page = st.sidebar.radio("Раздел", ["Инфоповоды", "Поиск сообщений"], label_visibility="collapsed")
