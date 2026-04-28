@@ -122,6 +122,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (event_id, message_id)
         );
 
+        CREATE TABLE IF NOT EXISTS message_topic_overrides (
+            message_id TEXT PRIMARY KEY,
+            source_main_topic TEXT,
+            source_topics TEXT,
+            note TEXT,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS manual_events (
             event_id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -209,6 +217,14 @@ def get_manual_events(conn) -> pd.DataFrame:
     if is_supabase_conn(conn):
         return _payload_df(conn, "manual_events")
     return pd.read_sql_query("SELECT * FROM manual_events", conn)
+
+
+def get_message_topic_overrides(conn) -> pd.DataFrame:
+    """Return manual topic assignments for messages."""
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "message_topic_overrides")
+    init_db(conn)
+    return pd.read_sql_query("SELECT * FROM message_topic_overrides", conn)
 
 
 def get_dashboard_summary(conn, summary_key: str) -> dict:
@@ -472,6 +488,47 @@ def restore_message_relevance(conn, event_id: str, message_id: str) -> None:
     conn.execute("DELETE FROM event_message_exclusions WHERE event_id = ? AND message_id = ?", (event_id, message_id))
     conn.commit()
     log(conn, "restore_message_relevance", "message", message_id, f"event={event_id}")
+
+
+def save_message_topic_override(
+    conn,
+    message_id: str,
+    source_main_topic: str = "",
+    source_topics: str = "",
+    note: str = "",
+) -> None:
+    """Assign or correct the source/topic label for a message without deleting it from its event."""
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        raise ValueError("Не удалось определить сообщение.")
+    main_topic = str(source_main_topic or "").strip()
+    topics = str(source_topics or "").strip() or main_topic
+    payload = {
+        "message_id": message_id,
+        "source_main_topic": main_topic,
+        "source_topics": topics,
+        "note": str(note or ""),
+        "updated_at": now(),
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "message_topic_overrides", f"message_topic_overrides:{message_id}", payload)
+        log(conn, "save_message_topic_override", "message", message_id, f"topic={main_topic}; note={note}")
+        return
+    init_db(conn)
+    conn.execute(
+        """
+        INSERT INTO message_topic_overrides(message_id, source_main_topic, source_topics, note, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            source_main_topic=excluded.source_main_topic,
+            source_topics=excluded.source_topics,
+            note=excluded.note,
+            updated_at=excluded.updated_at
+        """,
+        (message_id, main_topic, topics, str(note or ""), now()),
+    )
+    conn.commit()
+    log(conn, "save_message_topic_override", "message", message_id, f"topic={main_topic}; note={note}")
 
 
 def pin_key_message(conn, event_id: str, message_id: str, note: str = "") -> None:

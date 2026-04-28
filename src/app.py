@@ -27,6 +27,7 @@ from manual_db import (
     get_message_overrides,
     get_message_exclusions,
     get_manual_events,
+    get_message_topic_overrides,
     create_manual_event,
     save_event_override,
     merge_events,
@@ -37,6 +38,7 @@ from manual_db import (
     get_key_message_pins,
     pin_key_message,
     unpin_key_message,
+    save_message_topic_override,
     get_dashboard_summary,
     save_dashboard_summary,
 )
@@ -180,6 +182,56 @@ def normalize_manual_tags(tags: str) -> str:
             seen.add(key)
             items.append(item)
     return "|".join(items)
+
+
+def format_tags_for_display(tags: str) -> str:
+    """Human-friendly tag rendering for message/event tables."""
+    items = [
+        re.sub(r"\s+", " ", t).strip()
+        for t in re.split(r"[|;,]", str(tags or ""))
+        if re.sub(r"\s+", " ", t).strip()
+    ]
+    seen = []
+    for item in items:
+        if item not in seen:
+            seen.append(item)
+    return "; ".join(seen)
+
+
+def collect_available_source_topics(events: pd.DataFrame, messages: pd.DataFrame) -> list[str]:
+    """Return source/main topics found in current data for manual assignment."""
+    values: list[str] = []
+    for df, cols in [
+        (events, ["source_main_topics", "source_topics", "source_main_topic"]),
+        (messages, ["source_main_topic", "source_topics"]),
+    ]:
+        if df is None or df.empty:
+            continue
+        for col in cols:
+            if col not in df.columns:
+                continue
+            for raw in df[col].fillna("").astype(str):
+                for item in re.split(r"[;|]", raw):
+                    item = re.sub(r"\s+", " ", item).strip()
+                    if item:
+                        values.append(item)
+    seen = {}
+    for value in values:
+        key = value.lower().replace("ё", "е")
+        if key not in seen:
+            seen[key] = value
+    return sorted(seen.values(), key=lambda x: x.lower().replace("ё", "е"))
+
+
+def message_topic_display(row: pd.Series, fallback_event_title: str = "") -> str:
+    """Topic label shown in the full message feed."""
+    for col in ["source_main_topic", "source_topics"]:
+        value = str(row.get(col, "") or "").strip()
+        if value and value.lower() not in {"nan", "none", "nat", "<na>"}:
+            first = re.split(r"[;|]", value)[0].strip()
+            if first:
+                return first
+    return str(fallback_event_title or "").strip()
 
 
 def append_manual_events(events: pd.DataFrame, manual_events: pd.DataFrame) -> pd.DataFrame:
@@ -392,6 +444,7 @@ def apply_manual_edits(
     message_overrides: pd.DataFrame,
     message_exclusions: pd.DataFrame | None = None,
     manual_events: pd.DataFrame | None = None,
+    message_topic_overrides: pd.DataFrame | None = None,
 ):
     events = append_manual_events(events.copy(), manual_events)
     links = event_discussions.copy()
@@ -453,6 +506,27 @@ def apply_manual_edits(
     )
 
     enriched_messages = messages.merge(msg_event, on="message_id", how="left")
+
+    if message_topic_overrides is not None and not message_topic_overrides.empty and "message_id" in enriched_messages.columns:
+        topic_overrides = message_topic_overrides.copy()
+        topic_overrides["message_id"] = topic_overrides["message_id"].astype(str)
+        for _, topic_row in topic_overrides.iterrows():
+            msg_id = str(topic_row.get("message_id", "")).strip()
+            if not msg_id:
+                continue
+            mask = enriched_messages["message_id"].astype(str) == msg_id
+            if not mask.any():
+                continue
+            main_topic = str(topic_row.get("source_main_topic", "") or "").strip()
+            source_topics = str(topic_row.get("source_topics", "") or "").strip() or main_topic
+            if main_topic:
+                if "source_main_topic" not in enriched_messages.columns:
+                    enriched_messages["source_main_topic"] = ""
+                enriched_messages.loc[mask, "source_main_topic"] = main_topic
+            if source_topics:
+                if "source_topics" not in enriched_messages.columns:
+                    enriched_messages["source_topics"] = ""
+                enriched_messages.loc[mask, "source_topics"] = source_topics
 
     if message_overrides is not None and not message_overrides.empty:
         hidden_msg = set(
@@ -1802,92 +1876,186 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
             st.info("Сообщения не найдены.")
         else:
             table = event_messages.copy()
-            table["Текст"] = table["text_clean"].fillna("").astype(str).str.slice(0, 300)
             table["Дата"] = format_date_series(table["datetime"])
+            table["Текст"] = table["text_clean"].fillna("").astype(str).str.slice(0, 420)
+            table["Тема"] = table.apply(lambda r: message_topic_display(r, str(ev.get("event_title", ""))), axis=1)
+            table["Теги"] = table.get("tags", "").apply(format_tags_for_display) if "tags" in table.columns else ""
             table["Чат"] = table.get("chat_title", "")
             table["Автор"] = table.get("author", "")
             table["Тональность"] = table.get("sentiment", "")
-            table["Теги"] = table.get("tags", "")
-
             table["Ссылка"] = table.get("message_link", "")
-            cols = ["Дата", "Чат", "Автор", "Тональность", "Теги", "Текст", "Ссылка"]
+
+            cols = ["Дата", "Текст", "Тема", "Теги", "Чат", "Автор", "Тональность", "Ссылка"]
             msg_select = st.dataframe(
                 table[cols],
                 use_container_width=True,
-                height=420,
+                height=460,
                 hide_index=True,
                 on_select="rerun",
                 selection_mode="single-row",
                 column_config={
-                    "Ссылка": st.column_config.LinkColumn("Ссылка"),
-                    "Текст": st.column_config.TextColumn(width="large"),
+                    "Дата": st.column_config.TextColumn("Дата", width="small"),
+                    "Текст": st.column_config.TextColumn("Текст", width="large"),
+                    "Тема": st.column_config.TextColumn("Тема", width="medium"),
+                    "Теги": st.column_config.TextColumn("Теги", width="medium"),
+                    "Ссылка": st.column_config.LinkColumn("Ссылка", width="small"),
                 },
             )
 
             rows = get_selected_rows(msg_select)
             if rows:
                 row = table.iloc[rows[0]]
-                st.markdown("#### Полный текст")
+                message_id = str(row.get("message_id", "")).strip()
+                st.markdown("#### Выбранное сообщение")
+                st.caption(
+                    f"{format_date(row.get('datetime'))} · {row.get('chat_title', '')} · "
+                    f"{row.get('author', '')} · текущая тема: {message_topic_display(row, str(ev.get('event_title', '')))}"
+                )
                 st.write(row.get("text_clean", ""))
+
                 if can_edit:
-                    with st.expander("Перенести, исключить, скрыть или пометить ключевым", expanded=False):
-                        st.caption(
-                            "«Ключевое» закрепляет сообщение в разделе ключевых сообщений. "
-                            "«Нерелевант» убирает сообщение только из текущего инфоповода. "
-                            "Сообщение остается в базе и поиске."
+                    with st.expander("Назначить тему или инфоповод", expanded=True):
+                        msg_note = st.text_input(
+                            "Комментарий к действию",
+                            value="",
+                            key=f"msg_note_{event_id}_{message_id}",
                         )
-                        target_options = events[["event_id", "event_title", "message_count"]].copy()
-                        target_options["label"] = target_options.apply(
-                            lambda r: f"{str(r['event_title'])[:110]} · {int(r.get('message_count', 0))} сообщ.",
-                            axis=1,
+
+                        st.markdown("##### Назначить тему")
+                        available_topics = collect_available_source_topics(events, messages)
+                        current_topic = message_topic_display(row, str(ev.get("event_title", "")))
+                        topic_options = [""] + available_topics
+                        default_topic_idx = 0
+                        for i, item in enumerate(topic_options):
+                            if item and item.lower().replace("ё", "е") == current_topic.lower().replace("ё", "е"):
+                                default_topic_idx = i
+                                break
+                        selected_topic = st.selectbox(
+                            "Тема сообщения",
+                            options=topic_options,
+                            index=default_topic_idx,
+                            format_func=lambda x: x or "— выбрать из найденных тем —",
+                            key=f"topic_select_{event_id}_{message_id}",
                         )
-                        current_matches = target_options.index[target_options["event_id"] == event_id].tolist()
-                        current_idx = int(current_matches[0]) if current_matches else 0
-                        target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
-                        msg_note = st.text_input("Комментарий", value="", key=f"msg_note_{event_id}_{row['message_id']}")
-                        col_a, col_b, col_c, col_d = st.columns(4)
-                        if col_a.button("Перенести", key=f"move_{event_id}_{row['message_id']}"):
-                            target_id = target_options.loc[target_options["label"] == target_label, "event_id"].iloc[0]
-                            move_message(conn, row["message_id"], target_id, note=msg_note)
-                            st.success("Сообщение перенесено.")
-                            st.cache_data.clear()
-                            st.rerun()
-                        if col_b.button("Нерелевант", key=f"irrelevant_{event_id}_{row['message_id']}"):
-                            mark_message_irrelevant(conn, event_id, row["message_id"], reason=msg_note)
+                        custom_topic = st.text_input(
+                            "Или новая тема",
+                            value="",
+                            placeholder="Например: Детские кресла",
+                            key=f"custom_topic_{event_id}_{message_id}",
+                        )
+                        topic_to_save = custom_topic.strip() or selected_topic.strip()
+                        if st.button(
+                            "Сохранить тему сообщения",
+                            disabled=not bool(topic_to_save),
+                            key=f"save_topic_{event_id}_{message_id}",
+                        ):
+                            try:
+                                save_message_topic_override(
+                                    conn,
+                                    message_id,
+                                    source_main_topic=topic_to_save,
+                                    source_topics=topic_to_save,
+                                    note=msg_note,
+                                )
+                                st.success("Тема сообщения сохранена.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+                        st.markdown("##### Назначить инфоповод")
+                        target_options = events[["event_id", "event_title", "message_count", "start_date", "end_date"]].copy()
+                        target_options["event_id"] = target_options["event_id"].astype(str)
+                        target_options = target_options.sort_values(["message_count", "event_title"], ascending=[False, True])
+                        event_search = st.text_input(
+                            "Поиск инфоповода",
+                            value="",
+                            placeholder="Начните вводить название темы",
+                            key=f"event_search_{event_id}_{message_id}",
+                        )
+                        if event_search.strip():
+                            q = event_search.strip().lower().replace("ё", "е")
+                            target_options = target_options[
+                                target_options["event_title"].fillna("").astype(str).str.lower().str.replace("ё", "е", regex=False).str.contains(q, regex=False, na=False)
+                            ]
+
+                        target_label_map = {}
+                        for _, target_row in target_options.iterrows():
+                            target_id = str(target_row.get("event_id", ""))
+                            title_part = str(target_row.get("event_title", "") or "Без названия")[:120]
+                            msg_count = int(target_row.get("message_count", 0) or 0)
+                            period_part = format_period(target_row)
+                            suffix = f" · {msg_count} сообщ."
+                            if period_part:
+                                suffix += f" · {period_part}"
+                            target_label_map[target_id] = f"{title_part}{suffix}"
+
+                        target_ids = list(target_label_map.keys())
+                        current_target_idx = 0
+                        if str(event_id) in target_ids:
+                            current_target_idx = target_ids.index(str(event_id))
+                        selected_target_id = st.selectbox(
+                            "Инфоповод сообщения",
+                            options=target_ids,
+                            index=current_target_idx if target_ids else None,
+                            format_func=lambda x: target_label_map.get(str(x), str(x)),
+                            key=f"target_event_id_{event_id}_{message_id}",
+                            disabled=not bool(target_ids),
+                        )
+                        if selected_target_id:
+                            st.caption(f"Будет назначен инфоповод: {target_label_map.get(str(selected_target_id), selected_target_id)}")
+
+                        action_cols = st.columns(4)
+                        if action_cols[0].button(
+                            "Назначить инфоповод",
+                            disabled=not bool(selected_target_id) or str(selected_target_id) == str(event_id),
+                            key=f"assign_event_{event_id}_{message_id}",
+                        ):
+                            try:
+                                move_message(conn, message_id, str(selected_target_id), note=msg_note)
+                                st.success("Сообщению назначен выбранный инфоповод.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+                        if action_cols[1].button("Нерелевант", key=f"irrelevant_{event_id}_{message_id}"):
+                            mark_message_irrelevant(conn, event_id, message_id, reason=msg_note)
                             st.success("Сообщение исключено из текущего инфоповода как нерелевантное.")
                             st.cache_data.clear()
                             st.rerun()
-                        if col_c.button("Скрыть везде", key=f"hide_{event_id}_{row['message_id']}"):
-                            hide_message(conn, row["message_id"], hidden=True, note=msg_note)
+
+                        if action_cols[2].button("Скрыть везде", key=f"hide_{event_id}_{message_id}"):
+                            hide_message(conn, message_id, hidden=True, note=msg_note)
                             st.success("Сообщение скрыто во всех разделах дашборда.")
                             st.cache_data.clear()
                             st.rerun()
-                        message_id_str = str(row["message_id"])
-                        already_key = message_id_str in pinned_message_ids
-                        if col_d.button("Ключевое", disabled=already_key, key=f"pin_key_{event_id}_{row['message_id']}"):
-                            pin_key_message(conn, event_id, row["message_id"], note=msg_note)
+
+                        already_key = message_id in pinned_message_ids
+                        if action_cols[3].button("Ключевое", disabled=already_key, key=f"pin_key_{event_id}_{message_id}"):
+                            pin_key_message(conn, event_id, message_id, note=msg_note)
                             st.success("Сообщение добавлено в ключевые.")
                             st.cache_data.clear()
                             st.rerun()
                         if already_key:
                             st.caption("Это сообщение уже закреплено как ключевое для текущего инфоповода.")
 
-                        st.markdown("##### Создать новый инфоповод для этого сообщения")
-                        st.caption("Если подходящей темы нет в списке, создайте новую — выбранное сообщение сразу будет перенесено туда.")
-                        with st.form(f"create_event_for_message_{event_id}_{row['message_id']}"):
-                            new_title = st.text_input("Название новой темы", key=f"new_event_title_{event_id}_{row['message_id']}")
+                        st.markdown("##### Создать новый инфоповод и назначить его сообщению")
+                        st.caption("Если подходящего инфоповода нет в списке, создайте новый — выбранное сообщение сразу будет перенесено туда.")
+                        with st.form(f"create_event_for_message_{event_id}_{message_id}"):
+                            new_title = st.text_input("Название нового инфоповода", key=f"new_event_title_{event_id}_{message_id}")
                             new_summary = st.text_area(
-                                "Описание новой темы",
+                                "Описание нового инфоповода",
                                 value="",
                                 height=90,
-                                key=f"new_event_summary_{event_id}_{row['message_id']}",
+                                key=f"new_event_summary_{event_id}_{message_id}",
                             )
                             new_tags = st.text_input(
-                                "Теги новой темы",
+                                "Теги нового инфоповода",
                                 value=str(row.get("tags", "")).replace("|", ", "),
-                                key=f"new_event_tags_{event_id}_{row['message_id']}",
+                                key=f"new_event_tags_{event_id}_{message_id}",
                             )
-                            create_and_move = st.form_submit_button("Создать и перенести сообщение")
+                            create_and_move = st.form_submit_button("Создать и назначить")
                             if create_and_move:
                                 try:
                                     new_event_id = create_manual_event(
@@ -1896,10 +2064,10 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                                         summary=new_summary,
                                         status="новый",
                                         main_tags=normalize_manual_tags(new_tags),
-                                        note=f"Создано из сообщения {row['message_id']}",
+                                        note=f"Создано из сообщения {message_id}",
                                     )
-                                    move_message(conn, row["message_id"], new_event_id, note="Перенесено в новый инфоповод")
-                                    st.success("Новый инфоповод создан, сообщение перенесено.")
+                                    move_message(conn, message_id, new_event_id, note="Назначено в новый инфоповод")
+                                    st.success("Новый инфоповод создан, сообщение назначено в него.")
                                     st.cache_data.clear()
                                     st.rerun()
                                 except Exception as e:
@@ -2456,7 +2624,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.3: добавлена поддержка готовой разметки тем из файла")
+        st.caption("Версия 3.4: обновлена лента сообщений и добавлено назначение темы/инфоповода")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
@@ -2489,6 +2657,7 @@ def main():
     msg_overrides = get_message_overrides(conn)
     msg_exclusions = get_message_exclusions(conn)
     manual_events = get_manual_events(conn)
+    msg_topic_overrides = get_message_topic_overrides(conn)
 
     events, enriched_messages = apply_manual_edits(
         events_raw,
@@ -2500,6 +2669,7 @@ def main():
         msg_overrides,
         msg_exclusions,
         manual_events,
+        msg_topic_overrides,
     )
 
     if page == "Поиск сообщений":
