@@ -8,6 +8,7 @@ Run locally:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 from datetime import date, datetime
@@ -32,6 +33,8 @@ from manual_db import (
     hide_message,
     mark_message_irrelevant,
     restore_message_relevance,
+    get_dashboard_summary,
+    save_dashboard_summary,
 )
 from settings import STATUS_OPTIONS
 from preprocess import run_preprocess, run_preprocess_from_dataframe
@@ -800,6 +803,192 @@ def show_kpis(events: pd.DataFrame):
     c3.metric("Чатов", int(events["chat_count"].max()) if len(events) else 0)
     c4.metric("Негатив", format_pct(events["negative_count"].sum() / events["message_count"].sum()) if len(events) and events["message_count"].sum() else "0%")
     c5.metric("Высокая важность", int((events["importance_score"] >= events["importance_score"].quantile(0.75)).sum()) if len(events) else 0)
+
+
+def _split_pipe_values(series: pd.Series) -> list[str]:
+    values: list[str] = []
+    if series is None:
+        return values
+    for raw in series.fillna("").astype(str):
+        for item in raw.replace(";", "|").replace(",", "|").split("|"):
+            item = re.sub(r"\s+", " ", item).strip()
+            if item:
+                values.append(item)
+    return values
+
+
+def _format_top_items(items: list[tuple[str, int]], limit: int = 5) -> str:
+    filtered = [(str(name).strip(), int(count)) for name, count in items if str(name).strip()]
+    if not filtered:
+        return "нет выраженных лидеров"
+    return "; ".join(f"{name} — {count}" for name, count in filtered[:limit])
+
+
+def _summary_key(period_ids: list[str]) -> str:
+    if period_ids:
+        raw = "|".join(sorted(str(x) for x in period_ids if str(x).strip()))
+        digest = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"periods:{digest}"
+    return "local:current"
+
+
+def _period_label(period_ids: list[str]) -> str:
+    if not period_ids:
+        return "текущая выборка"
+    try:
+        periods = list_periods(include_inactive=True)
+        if not periods.empty and "period_id" in periods.columns:
+            selected = periods[periods["period_id"].astype(str).isin([str(x) for x in period_ids])].copy()
+            if not selected.empty:
+                names = selected.get("period_name", selected["period_id"]).fillna("").astype(str).tolist()
+                names = [name for name in names if name]
+                if len(names) == 1:
+                    return names[0]
+                if 1 < len(names) <= 3:
+                    return ", ".join(names)
+                if len(names) > 3:
+                    return f"{len(names)} выбранных периода"
+    except Exception:
+        pass
+    return f"{len(period_ids)} выбранных периода" if len(period_ids) != 1 else str(period_ids[0])
+
+
+def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str]) -> str:
+    """Build a readable editorial summary for the selected period(s)."""
+    visible_messages = messages.copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
+    visible_events = events.copy() if isinstance(events, pd.DataFrame) else pd.DataFrame()
+
+    if "message_hidden" in visible_messages.columns:
+        visible_messages = visible_messages[~visible_messages["message_hidden"].astype(bool)]
+    if "is_hidden" in visible_events.columns:
+        visible_events = visible_events[~visible_events["is_hidden"].astype(bool)]
+
+    period_name = _period_label(period_ids)
+
+    if visible_messages.empty and visible_events.empty:
+        return f"За период «{period_name}» данных для саммари пока недостаточно."
+
+    msg_count = int(len(visible_messages)) if not visible_messages.empty else int(visible_events.get("message_count", pd.Series(dtype=int)).sum())
+
+    chat_col = "chat_title" if "chat_title" in visible_messages.columns else "chat_id" if "chat_id" in visible_messages.columns else None
+    author_col = "author" if "author" in visible_messages.columns else "author_id" if "author_id" in visible_messages.columns else None
+    chat_count = int(visible_messages[chat_col].nunique()) if chat_col and not visible_messages.empty else int(visible_events.get("chat_count", pd.Series(dtype=int)).max() if not visible_events.empty else 0)
+    author_count = int(visible_messages[author_col].nunique()) if author_col and not visible_messages.empty else int(visible_events.get("author_count", pd.Series(dtype=int)).max() if not visible_events.empty else 0)
+
+    if "is_negative" in visible_messages.columns and not visible_messages.empty:
+        neg_mask = visible_messages["is_negative"].astype(str).str.lower().isin(["true", "1", "yes", "да"])
+        negative_count = int(neg_mask.sum())
+    elif "sentiment" in visible_messages.columns and not visible_messages.empty:
+        neg_mask = visible_messages["sentiment"].astype(str).str.lower().str.contains("нег|neg", regex=True, na=False)
+        negative_count = int(neg_mask.sum())
+    else:
+        negative_count = int(visible_events.get("negative_count", pd.Series(dtype=int)).sum() if not visible_events.empty else 0)
+    negative_share = negative_count / msg_count if msg_count else 0.0
+
+    date_part = ""
+    if "datetime" in visible_messages.columns and not visible_messages.empty:
+        dt = pd.to_datetime(visible_messages["datetime"], errors="coerce").dropna()
+        if not dt.empty:
+            start_s = format_date(dt.min())
+            end_s = format_date(dt.max())
+            if start_s and end_s and start_s != end_s:
+                date_part = f" ({start_s} — {end_s})"
+            elif start_s:
+                date_part = f" ({start_s})"
+
+    top_chats_text = "нет данных"
+    if chat_col and not visible_messages.empty:
+        top_chats = (
+            visible_messages[chat_col]
+            .fillna("")
+            .astype(str)
+            .replace("", np.nan)
+            .dropna()
+            .value_counts()
+            .head(5)
+        )
+        top_chats_text = _format_top_items(list(top_chats.items()))
+
+    top_events_text = "нет выраженных тем"
+    if not visible_events.empty and "event_title" in visible_events.columns:
+        event_metric = "message_count" if "message_count" in visible_events.columns else None
+        top_events = visible_events.copy()
+        if event_metric:
+            top_events[event_metric] = pd.to_numeric(top_events[event_metric], errors="coerce").fillna(0).astype(int)
+            top_events = top_events.sort_values(event_metric, ascending=False).head(6)
+            top_events_text = _format_top_items(list(zip(top_events["event_title"], top_events[event_metric])), limit=6)
+        else:
+            top_events_text = "; ".join(top_events["event_title"].dropna().astype(str).head(6).tolist())
+
+    negative_events_text = "нет выраженного негативного ядра"
+    if not visible_events.empty and {"event_title", "negative_count"}.issubset(visible_events.columns):
+        neg_events = visible_events.copy()
+        neg_events["negative_count"] = pd.to_numeric(neg_events["negative_count"], errors="coerce").fillna(0).astype(int)
+        neg_events = neg_events[neg_events["negative_count"] > 0].sort_values("negative_count", ascending=False).head(5)
+        if not neg_events.empty:
+            negative_events_text = _format_top_items(list(zip(neg_events["event_title"], neg_events["negative_count"])))
+
+    tag_values: list[str] = []
+    if "main_tags" in visible_events.columns:
+        tag_values.extend(_split_pipe_values(visible_events["main_tags"]))
+    if "tags" in visible_messages.columns:
+        tag_values.extend(_split_pipe_values(visible_messages["tags"]))
+    tag_text = "нет явных тегов"
+    if tag_values:
+        top_tags = pd.Series(tag_values).value_counts().head(7)
+        tag_text = _format_top_items(list(top_tags.items()), limit=7)
+
+    lines = [
+        f"За период «{period_name}»{date_part} собрано {msg_count:,} сообщений из {chat_count:,} чатов".replace(",", " ") + (f" от {author_count:,} авторов".replace(",", " ") if author_count else "") + ".",
+        f"Негатив: {negative_count:,} сообщений, доля — {format_pct(negative_share)}.".replace(",", " "),
+        f"Наиболее активные чаты: {top_chats_text}.",
+        f"Основные инфоповоды: {top_events_text}.",
+        f"Чаще всего встречающиеся темы/теги: {tag_text}.",
+        f"Основные источники негатива: {negative_events_text}.",
+    ]
+    return "\n".join(f"• {line}" for line in lines)
+
+
+def render_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str], conn, can_edit: bool) -> None:
+    """Render editable period summary before the information-events block."""
+    key = _summary_key(period_ids)
+    auto_summary = build_auto_dashboard_summary(events, messages, period_ids)
+    saved = get_dashboard_summary(conn, key)
+    saved_text = str(saved.get("summary", "") or "").strip() if isinstance(saved, dict) else ""
+    summary_text = saved_text or auto_summary
+
+    st.subheader("Саммари периода")
+    if saved_text:
+        st.caption("Показано ручное саммари. Автоматическое саммари можно вернуть, очистив ручную версию.")
+    else:
+        st.caption("Автоматическое саммари сформировано по выбранному периоду и текущей структуре инфоповодов.")
+
+    st.markdown(summary_text.replace("\n", "  \n"))
+
+    if not can_edit:
+        return
+
+    with st.expander("Редактировать саммари", expanded=False):
+        with st.form(f"dashboard_summary_form_{key}"):
+            edited_summary = st.text_area(
+                "Саммари",
+                value=summary_text,
+                height=220,
+                help="Этот текст будет показываться перед таблицей инфоповодов для выбранного периода или набора периодов.",
+            )
+            note = st.text_input("Комментарий к правке", value=str(saved.get("note", "") or "") if isinstance(saved, dict) else "")
+            c1, c2 = st.columns(2)
+            save_clicked = c1.form_submit_button("Сохранить саммари", type="primary")
+            reset_clicked = c2.form_submit_button("Вернуть автоматическое")
+
+        if save_clicked:
+            save_dashboard_summary(conn, key, edited_summary.strip(), note=note, period_ids=period_ids)
+            st.success("Саммари сохранено.")
+            st.rerun()
+        if reset_clicked:
+            save_dashboard_summary(conn, key, "", note=note, period_ids=period_ids)
+            st.success("Ручное саммари очищено. Будет показана автоматическая версия.")
+            st.rerun()
 
 
 
@@ -1746,7 +1935,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.5: исправлено безопасное отображение пустых дат в периодах")
+    st.caption("Версия 2.6: добавлено редактируемое саммари периода перед инфоповодами")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -1816,6 +2005,8 @@ def main():
 
     if persistent_enabled and len(selected_period_ids) >= 2:
         render_period_comparison(enriched_messages, selected_period_ids)
+
+    render_dashboard_summary(events, enriched_messages, selected_period_ids, conn, can_edit)
 
     filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
     show_kpis(filtered_events)

@@ -126,6 +126,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS period_summaries (
+            summary_key TEXT PRIMARY KEY,
+            summary TEXT,
+            note TEXT,
+            period_ids TEXT,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             action TEXT NOT NULL,
@@ -185,6 +193,49 @@ def get_manual_events(conn) -> pd.DataFrame:
     if is_supabase_conn(conn):
         return _payload_df(conn, "manual_events")
     return pd.read_sql_query("SELECT * FROM manual_events", conn)
+
+
+def get_dashboard_summary(conn, summary_key: str) -> dict:
+    """Return editable dashboard/period summary by key."""
+    summary_key = str(summary_key or "local:current").strip() or "local:current"
+    if is_supabase_conn(conn):
+        return _get_payload(conn, "period_summaries", f"period_summaries:{summary_key}")
+    init_db(conn)
+    row = conn.execute("SELECT * FROM period_summaries WHERE summary_key = ?", (summary_key,)).fetchone()
+    if not row:
+        return {}
+    return dict(row)
+
+
+def save_dashboard_summary(conn, summary_key: str, summary: str, note: str = "", period_ids: list[str] | None = None) -> None:
+    """Save editable dashboard/period summary. Empty summary means fallback to auto summary."""
+    summary_key = str(summary_key or "local:current").strip() or "local:current"
+    payload = {
+        "summary_key": summary_key,
+        "summary": str(summary or ""),
+        "note": str(note or ""),
+        "period_ids": "|".join(str(x) for x in (period_ids or []) if str(x).strip()),
+        "updated_at": now(),
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "period_summaries", f"period_summaries:{summary_key}", payload)
+        log(conn, "save_dashboard_summary", "period_summary", summary_key)
+        return
+    init_db(conn)
+    conn.execute(
+        """
+        INSERT INTO period_summaries(summary_key, summary, note, period_ids, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(summary_key) DO UPDATE SET
+            summary=excluded.summary,
+            note=excluded.note,
+            period_ids=excluded.period_ids,
+            updated_at=excluded.updated_at
+        """,
+        (payload["summary_key"], payload["summary"], payload["note"], payload["period_ids"], payload["updated_at"]),
+    )
+    conn.commit()
+    log(conn, "save_dashboard_summary", "period_summary", summary_key)
 
 
 def create_manual_event(
