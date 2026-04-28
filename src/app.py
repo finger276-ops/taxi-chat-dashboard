@@ -812,12 +812,31 @@ def build_period_comparison_df(messages: pd.DataFrame, period_ids: list[str], pe
     else:
         summary["period_name"] = summary["period_id"]
 
-    summary["period_name"] = summary.get("period_name", summary["period_id"]).fillna(summary["period_id"]).astype(str)
-    summary["sort_date"] = pd.to_datetime(summary.get("date_from"), errors="coerce")
+    # Normalize period names to plain strings. Supabase/JSON values can occasionally
+    # come back as mixed objects; sorting mixed Python objects may crash pandas.
+    if "period_name" not in summary.columns:
+        summary["period_name"] = summary["period_id"]
+    summary["period_name"] = summary["period_name"].where(
+        summary["period_name"].notna(),
+        summary["period_id"],
+    ).map(lambda value: "" if pd.isna(value) else str(value))
+
+    # Build a stable string sort key instead of sorting raw datetimes.
+    # This avoids pandas TypeError when selected periods contain a mix of
+    # timezone-aware, timezone-naive, empty, or malformed dates.
+    date_from_series = summary["date_from"] if "date_from" in summary.columns else pd.Series([pd.NaT] * len(summary), index=summary.index)
+    sort_date = pd.to_datetime(date_from_series, errors="coerce", utc=True)
     if "uploaded_at" in summary.columns:
-        summary["sort_date"] = summary["sort_date"].combine_first(pd.to_datetime(summary["uploaded_at"], errors="coerce"))
-    summary["sort_date"] = summary["sort_date"].fillna(pd.Timestamp.max)
-    summary = summary.sort_values(["sort_date", "period_name"], ascending=[True, True]).reset_index(drop=True)
+        uploaded_at = pd.to_datetime(summary["uploaded_at"], errors="coerce", utc=True)
+        sort_date = sort_date.combine_first(uploaded_at)
+
+    summary["sort_date"] = sort_date.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("9999-12-31 23:59:59")
+    summary["period_name_sort"] = summary["period_name"].fillna("").astype(str)
+    summary = summary.sort_values(
+        ["sort_date", "period_name_sort"],
+        ascending=[True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
     summary["negative_share_pct"] = (summary["negative_share"] * 100).round(1)
     summary["label"] = summary["period_name"]
     return summary
@@ -1533,7 +1552,7 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.6: добавлено визуальное сравнение периодов по количеству сообщений и доле негатива")
+    st.caption("Версия 2.0: исправлена сортировка периодов в блоке динамики сообщений и негатива")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
