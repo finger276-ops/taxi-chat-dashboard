@@ -1012,10 +1012,11 @@ def render_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, perio
     summary_text = saved_text or auto_summary
 
     st.subheader("Саммари периода")
-    if saved_text:
-        st.caption("Показано ручное саммари. Автоматическое саммари можно вернуть, очистив ручную версию.")
-    else:
-        st.caption("Автоматическое саммари сформировано по выбранному периоду и текущей структуре инфоповодов.")
+    if can_edit:
+        if saved_text:
+            st.caption("Показано ручное саммари. Автоматическое саммари можно вернуть, очистив ручную версию.")
+        else:
+            st.caption("Автоматическое саммари сформировано по выбранному периоду и текущей структуре инфоповодов.")
 
     st.markdown(format_dashboard_summary_markdown(summary_text).replace("\n", "  \n"))
 
@@ -2273,7 +2274,6 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 3.0: добавлена ручная отметка ключевых сообщений")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -2287,6 +2287,8 @@ def main():
         st.sidebar.info("Хранилище: локальные файлы")
 
     can_edit = render_admin_mode()
+    if can_edit:
+        st.caption("Версия 3.1: технические подписи скрыты от пользовательского доступа")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
