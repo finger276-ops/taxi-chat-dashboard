@@ -1546,13 +1546,13 @@ def main():
     args = parse_args()
 
     st.set_page_config(
-        page_title="Инфоповоды в чатах такси",
+        page_title="Дайджест водительских чатов",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 2.0: исправлена сортировка периодов в блоке динамики сообщений и негатива")
+    st.title("Дайджест водительских чатов")
+    st.caption("Версия 2.1: дашборд переименован в «Дайджест водительских чатов»")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
