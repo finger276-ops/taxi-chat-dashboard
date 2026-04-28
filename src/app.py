@@ -737,6 +737,170 @@ def show_kpis(events: pd.DataFrame):
 
 
 
+def _safe_int_delta(value) -> str:
+    try:
+        return f"{int(value):+d}"
+    except Exception:
+        return "0"
+
+
+
+def _safe_pct_delta(current: float, previous: float) -> str:
+    try:
+        if previous in [0, None] or pd.isna(previous):
+            return "н/д"
+        return f"{((current - previous) / previous) * 100:+.0f}%"
+    except Exception:
+        return "н/д"
+
+
+
+def build_period_comparison_df(messages: pd.DataFrame, period_ids: list[str], periods_meta: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build period-level comparison metrics from visible messages."""
+    if messages is None or messages.empty or "period_id" not in messages.columns:
+        return pd.DataFrame()
+
+    work = messages.copy()
+    if period_ids:
+        work = work[work["period_id"].astype(str).isin([str(x) for x in period_ids])]
+    if work.empty:
+        return pd.DataFrame()
+
+    if "message_hidden" in work.columns:
+        work = work[~work["message_hidden"].astype(bool)]
+    if work.empty:
+        return pd.DataFrame()
+
+    if "datetime" in work.columns:
+        work["datetime"] = pd.to_datetime(work["datetime"], errors="coerce")
+
+    if "is_negative" in work.columns:
+        work["__is_negative"] = work["is_negative"].astype(str).str.lower().isin(["true", "1", "yes", "да"]).astype(int)
+    elif "sentiment" in work.columns:
+        work["__is_negative"] = work["sentiment"].astype(str).str.lower().str.contains("neg").astype(int)
+    else:
+        work["__is_negative"] = 0
+
+    agg_dict = {
+        "message_count": ("period_id", "size"),
+        "negative_count": ("__is_negative", "sum"),
+    }
+    if "datetime" in work.columns:
+        agg_dict["date_from"] = ("datetime", "min")
+        agg_dict["date_to"] = ("datetime", "max")
+    if "chat_title" in work.columns:
+        agg_dict["chat_count"] = ("chat_title", pd.Series.nunique)
+
+    summary = work.groupby("period_id", dropna=False).agg(**agg_dict).reset_index()
+    summary["negative_share"] = np.where(
+        summary["message_count"] > 0,
+        summary["negative_count"] / summary["message_count"],
+        0.0,
+    )
+
+    if periods_meta is not None and not periods_meta.empty and "period_id" in periods_meta.columns:
+        meta_cols = [c for c in ["period_id", "period_name", "date_from", "date_to", "uploaded_at"] if c in periods_meta.columns]
+        meta = periods_meta[meta_cols].copy().drop_duplicates(subset=["period_id"])
+        summary = summary.merge(meta, on="period_id", how="left", suffixes=("", "_meta"))
+        if "date_from_meta" in summary.columns:
+            summary["date_from"] = summary["date_from_meta"].combine_first(summary.get("date_from"))
+        if "date_to_meta" in summary.columns:
+            summary["date_to"] = summary["date_to_meta"].combine_first(summary.get("date_to"))
+        drop_cols = [c for c in ["date_from_meta", "date_to_meta"] if c in summary.columns]
+        if drop_cols:
+            summary = summary.drop(columns=drop_cols)
+    else:
+        summary["period_name"] = summary["period_id"]
+
+    summary["period_name"] = summary.get("period_name", summary["period_id"]).fillna(summary["period_id"]).astype(str)
+    summary["sort_date"] = pd.to_datetime(summary.get("date_from"), errors="coerce")
+    if "uploaded_at" in summary.columns:
+        summary["sort_date"] = summary["sort_date"].combine_first(pd.to_datetime(summary["uploaded_at"], errors="coerce"))
+    summary["sort_date"] = summary["sort_date"].fillna(pd.Timestamp.max)
+    summary = summary.sort_values(["sort_date", "period_name"], ascending=[True, True]).reset_index(drop=True)
+    summary["negative_share_pct"] = (summary["negative_share"] * 100).round(1)
+    summary["label"] = summary["period_name"]
+    return summary
+
+
+
+def render_period_comparison(messages: pd.DataFrame, period_ids: list[str]):
+    """Render visual comparison across two or more selected periods."""
+    if not period_ids or len(period_ids) < 2:
+        return
+
+    try:
+        periods_meta = list_periods()
+    except Exception:
+        periods_meta = pd.DataFrame()
+
+    summary = build_period_comparison_df(messages, period_ids, periods_meta)
+    if summary.empty or len(summary) < 2:
+        return
+
+    latest = summary.iloc[-1]
+    previous = summary.iloc[-2]
+    msg_delta = int(latest["message_count"] - previous["message_count"])
+    neg_count_delta = int(latest["negative_count"] - previous["negative_count"])
+    neg_share_delta_pp = float((latest["negative_share"] - previous["negative_share"]) * 100)
+
+    st.subheader("Сравнение периодов")
+    st.caption(
+        f"Сейчас сравниваются {len(summary)} период(а/ов). Последний период: {latest['period_name']}. "
+        f"Сравнение ведется с предыдущим периодом: {previous['period_name']}."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        f"Сообщения · {latest['period_name']}",
+        f"{int(latest['message_count']):,}".replace(",", " "),
+        delta=_safe_int_delta(msg_delta),
+        help="Разница по общему количеству сообщений относительно предыдущего выбранного периода.",
+    )
+    c2.metric(
+        "Изменение сообщений",
+        _safe_pct_delta(float(latest["message_count"]), float(previous["message_count"])),
+        help="Процентное изменение количества сообщений относительно предыдущего периода.",
+    )
+    c3.metric(
+        f"Негатив · {latest['period_name']}",
+        format_pct(latest["negative_share"]),
+        delta=f"{neg_share_delta_pp:+.1f} п.п.",
+        help="Доля негативных сообщений и ее изменение в процентных пунктах относительно предыдущего периода.",
+    )
+    c4.metric(
+        "Негативных сообщений",
+        f"{int(latest['negative_count']):,}".replace(",", " "),
+        delta=_safe_int_delta(neg_count_delta),
+        help="Изменение числа негативных сообщений относительно предыдущего периода.",
+    )
+
+    chart_source = summary[["label", "message_count", "negative_share_pct"]].copy().rename(columns={
+        "label": "Период",
+        "message_count": "Сообщений",
+        "negative_share_pct": "Негатив, %",
+    })
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("Общее количество сообщений по периодам")
+        st.bar_chart(chart_source.set_index("Период")[["Сообщений"]], use_container_width=True)
+    with right:
+        st.caption("Доля негатива по периодам")
+        st.line_chart(chart_source.set_index("Период")[["Негатив, %"]], use_container_width=True)
+
+    table = summary.copy()
+    table["Период"] = table["period_name"]
+    table["Начало"] = format_date_series(table.get("date_from", pd.Series(dtype=str)))
+    table["Конец"] = format_date_series(table.get("date_to", pd.Series(dtype=str)))
+    table["Сообщений"] = table["message_count"].astype(int)
+    table["Негативных"] = table["negative_count"].astype(int)
+    table["Доля негатива"] = table["negative_share"].apply(format_pct)
+    display_cols = [c for c in ["Период", "Начало", "Конец", "Сообщений", "Негативных", "Доля негатива"] if c in table.columns]
+    st.dataframe(table[display_cols], use_container_width=True, hide_index=True)
+
+
+
 def word_message_results_table(messages: pd.DataFrame, events: pd.DataFrame, query: str):
     """Show all messages that match the sidebar word filter."""
     if not str(query or "").strip():
@@ -1193,6 +1357,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
     )
 
     persistent_enabled = supabase_configured()
+    selected_period_ids: list[str] = []
     if persistent_enabled:
         st.success("Постоянное хранение включено: CSV и обработанные периоды будут сохраняться в Supabase.")
     else:
@@ -1368,12 +1533,13 @@ def main():
     )
 
     st.title("Инфоповоды в Telegram-чатах такси")
-    st.caption("Версия 1.5: добавлен режим администратора для загрузки CSV и ручной модерации")
+    st.caption("Версия 1.6: добавлено визуальное сравнение периодов по количеству сообщений и доле негатива")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
     upload_dir = Path(args.upload_dir)
     persistent_enabled = supabase_configured()
+    selected_period_ids: list[str] = []
 
     if persistent_enabled:
         st.sidebar.success("Хранилище: Supabase")
@@ -1434,6 +1600,9 @@ def main():
         show_manual_event_creator(conn)
     else:
         st.sidebar.caption("Загрузка CSV и ручная модерация доступны после входа администратора.")
+
+    if persistent_enabled and len(selected_period_ids) >= 2:
+        render_period_comparison(enriched_messages, selected_period_ids)
 
     filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
     show_kpis(filtered_events)
