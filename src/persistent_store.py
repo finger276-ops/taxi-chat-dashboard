@@ -13,7 +13,7 @@ import json
 import os
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -325,9 +325,40 @@ def save_processed_tables_from_dir(
 
 
 def _normalize_date_for_db(value: Any) -> str | None:
-    if value is None or str(value).strip() == "":
+    """Normalize edited period dates to ISO YYYY-MM-DD without MM/DD ambiguity."""
+    if value is None:
         return None
-    dt = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.date().isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nat", "nan", "none"}:
+        return None
+
+    iso_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if iso_match:
+        try:
+            return date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))).isoformat()
+        except ValueError:
+            return None
+
+    ru_match = re.match(r"^(\d{1,2})[.](\d{1,2})[.](\d{2,4})$", text)
+    if ru_match:
+        day, month, year = [int(x) for x in ru_match.groups()]
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    dt = pd.to_datetime(text, errors="coerce", dayfirst=True)
     if pd.isna(dt):
         return None
     return dt.date().isoformat()

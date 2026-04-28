@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -562,15 +562,60 @@ def format_pct(value) -> str:
         return "0%"
 
 
+def parse_date_value(value):
+    """Parse a date value safely and prefer Russian DD.MM.YYYY for user input."""
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nat", "nan", "none"}:
+        return None
+
+    iso_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if iso_match:
+        try:
+            return date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+        except ValueError:
+            return None
+
+    ru_match = re.match(r"^(\d{1,2})[.](\d{1,2})[.](\d{2,4})$", text)
+    if ru_match:
+        day, month, year = [int(x) for x in ru_match.groups()]
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    dt = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return None
+    return dt.date()
+
+
+def date_to_iso(value) -> str | None:
+    parsed = parse_date_value(value)
+    return parsed.isoformat() if parsed else None
+
+
 def format_date(value) -> str:
     """Return a user-facing date without time: DD.MM.YYYY."""
-    dt = pd.to_datetime(value, errors="coerce")
-    return dt.strftime("%d.%m.%Y") if pd.notna(dt) else ""
+    parsed = parse_date_value(value)
+    return parsed.strftime("%d.%m.%Y") if parsed else ""
 
 
 def format_date_series(series: pd.Series) -> pd.Series:
     """Format pandas datetime/string series as DD.MM.YYYY strings for display tables."""
-    return pd.to_datetime(series, errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
+    return series.apply(format_date).fillna("")
 
 
 def period_note_from_manifest(value) -> str:
@@ -580,13 +625,7 @@ def period_note_from_manifest(value) -> str:
 
 
 def parse_user_date(value: str):
-    text = str(value or "").strip()
-    if not text:
-        return None
-    dt = pd.to_datetime(text, errors="coerce", dayfirst=True)
-    if pd.isna(dt):
-        return None
-    return dt.date().isoformat()
+    return date_to_iso(value)
 
 
 def format_period(row: pd.Series) -> str:
@@ -1464,8 +1503,8 @@ def render_period_history_manager(persistent_enabled: bool, upload_dir: Path):
     if not isinstance(current_manifest, dict):
         current_manifest = {}
 
-    date_from_s = format_date(selected.get("date_from"))
-    date_to_s = format_date(selected.get("date_to"))
+    date_from_value = parse_date_value(selected.get("date_from")) or datetime.now().date()
+    date_to_value = parse_date_value(selected.get("date_to")) or date_from_value
     status_options = ["active", "hidden", "archived"]
     current_status = str(selected.get("status") or "active")
     if current_status not in status_options:
@@ -1476,8 +1515,18 @@ def render_period_history_manager(persistent_enabled: bool, upload_dir: Path):
         new_name = c1.text_input("Название периода", value=str(selected.get("period_name") or ""))
         new_source = c2.text_input("Название исходного файла", value=str(selected.get("source_filename") or ""))
         d1, d2 = st.columns(2)
-        new_date_from = d1.text_input("Дата начала", value=date_from_s, help="Формат: ДД.ММ.ГГГГ")
-        new_date_to = d2.text_input("Дата окончания", value=date_to_s, help="Формат: ДД.ММ.ГГГГ")
+        new_date_from = d1.date_input(
+            "Дата начала",
+            value=date_from_value,
+            format="DD.MM.YYYY",
+            help="Дата хранится в Supabase как YYYY-MM-DD, а в интерфейсе отображается как ДД.ММ.ГГГГ.",
+        )
+        new_date_to = d2.date_input(
+            "Дата окончания",
+            value=date_to_value,
+            format="DD.MM.YYYY",
+            help="Дата хранится в Supabase как YYYY-MM-DD, а в интерфейсе отображается как ДД.ММ.ГГГГ.",
+        )
         new_status = st.selectbox(
             "Статус периода",
             status_options,
@@ -1488,13 +1537,16 @@ def render_period_history_manager(persistent_enabled: bool, upload_dir: Path):
         submitted = st.form_submit_button("Сохранить изменения", type="primary")
 
     if submitted:
-        parsed_from = parse_user_date(new_date_from)
-        parsed_to = parse_user_date(new_date_to)
-        if new_date_from.strip() and not parsed_from:
-            st.error("Не удалось распознать дату начала. Используйте формат ДД.ММ.ГГГГ.")
+        parsed_from = date_to_iso(new_date_from)
+        parsed_to = date_to_iso(new_date_to)
+        if not parsed_from:
+            st.error("Не удалось распознать дату начала.")
             return
-        if new_date_to.strip() and not parsed_to:
-            st.error("Не удалось распознать дату окончания. Используйте формат ДД.ММ.ГГГГ.")
+        if not parsed_to:
+            st.error("Не удалось распознать дату окончания.")
+            return
+        if parsed_from > parsed_to:
+            st.error("Дата начала не может быть позже даты окончания.")
             return
         try:
             update_period_metadata(
@@ -1686,7 +1738,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.3: добавлено редактирование истории загруженных файлов и периодов")
+    st.caption("Версия 2.4: исправлено редактирование дат периодов в формате ДД.ММ.ГГГГ")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
