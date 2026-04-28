@@ -832,6 +832,67 @@ def _summary_key(period_ids: list[str]) -> str:
     return "local:current"
 
 
+
+
+def _summary_period_range(messages) -> str:
+    """Return human-readable period range for summary without period title."""
+    if not isinstance(messages, pd.DataFrame) or messages.empty or "datetime" not in messages.columns:
+        return "выбранный период"
+    dt = pd.to_datetime(messages["datetime"], errors="coerce").dropna()
+    if dt.empty:
+        return "выбранный период"
+    start_s = format_date(dt.min())
+    end_s = format_date(dt.max())
+    if start_s and end_s and start_s != end_s:
+        return f"{start_s} — {end_s}"
+    if start_s:
+        return start_s
+    return "выбранный период"
+
+
+def format_dashboard_summary_markdown(text: str) -> str:
+    """Normalize summary display: remove legacy period title and bold leading labels."""
+    import re
+
+    value = str(text or "").strip()
+    if not value:
+        return ""
+
+    value = re.sub(
+        r"За период\s+«[^»]+»\s*\((\d{2}\.\d{2}\.\d{4}\s*[—-]\s*\d{2}\.\d{2}\.\d{4})\)",
+        r"За период \1",
+        value,
+    )
+    value = re.sub(
+        r"За период\s+«[^»]+»\s*\((\d{2}\.\d{2}\.\d{4})\)",
+        r"За период \1",
+        value,
+    )
+
+    labels = [
+        "Негатив",
+        "Наиболее активные чаты",
+        "Основные инфоповоды",
+        "Чаще всего встречающиеся темы/теги",
+        "Основные источники негатива",
+    ]
+    for label in labels:
+        value = re.sub(rf"(^|\n)(\s*•\s*){re.escape(label)}:", rf"\1\2**{label}:**", value)
+        value = re.sub(rf"(^|\n)(\s*){re.escape(label)}:", rf"\1\2**{label}:**", value)
+
+    value = re.sub(
+        r"(^|\n)(\s*•\s*)За период\s+([^\n]+?)\s+собрано",
+        r"\1\2**За период \3** собрано",
+        value,
+    )
+    value = re.sub(
+        r"(^|\n)(\s*)За период\s+([^\n]+?)\s+собрано",
+        r"\1\2**За период \3** собрано",
+        value,
+    )
+    return value
+
+
 def _period_label(period_ids: list[str]) -> str:
     if not period_ids:
         return "текущая выборка"
@@ -863,10 +924,10 @@ def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, p
     if "is_hidden" in visible_events.columns:
         visible_events = visible_events[~visible_events["is_hidden"].astype(bool)]
 
-    period_name = _period_label(period_ids)
+    period_range = _summary_period_range(visible_messages)
 
     if visible_messages.empty and visible_events.empty:
-        return f"За период «{period_name}» данных для саммари пока недостаточно."
+        return "**За выбранный период** данных для саммари пока недостаточно."
 
     msg_count = int(len(visible_messages)) if not visible_messages.empty else int(visible_events.get("message_count", pd.Series(dtype=int)).sum())
 
@@ -884,17 +945,6 @@ def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, p
     else:
         negative_count = int(visible_events.get("negative_count", pd.Series(dtype=int)).sum() if not visible_events.empty else 0)
     negative_share = negative_count / msg_count if msg_count else 0.0
-
-    date_part = ""
-    if "datetime" in visible_messages.columns and not visible_messages.empty:
-        dt = pd.to_datetime(visible_messages["datetime"], errors="coerce").dropna()
-        if not dt.empty:
-            start_s = format_date(dt.min())
-            end_s = format_date(dt.max())
-            if start_s and end_s and start_s != end_s:
-                date_part = f" ({start_s} — {end_s})"
-            elif start_s:
-                date_part = f" ({start_s})"
 
     top_chats_text = "нет данных"
     if chat_col and not visible_messages.empty:
@@ -939,12 +989,12 @@ def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, p
         tag_text = _format_top_items(list(top_tags.items()), limit=7)
 
     lines = [
-        f"За период «{period_name}»{date_part} собрано {msg_count:,} сообщений из {chat_count:,} чатов".replace(",", " ") + (f" от {author_count:,} авторов".replace(",", " ") if author_count else "") + ".",
-        f"Негатив: {negative_count:,} сообщений, доля — {format_pct(negative_share)}.".replace(",", " "),
-        f"Наиболее активные чаты: {top_chats_text}.",
-        f"Основные инфоповоды: {top_events_text}.",
-        f"Чаще всего встречающиеся темы/теги: {tag_text}.",
-        f"Основные источники негатива: {negative_events_text}.",
+        f"**За период {period_range}** собрано {msg_count:,} сообщений из {chat_count:,} чатов".replace(",", " ") + (f" от {author_count:,} авторов".replace(",", " ") if author_count else "") + ".",
+        f"**Негатив:** {negative_count:,} сообщений, доля — {format_pct(negative_share)}.".replace(",", " "),
+        f"**Наиболее активные чаты:** {top_chats_text}.",
+        f"**Основные инфоповоды:** {top_events_text}.",
+        f"**Чаще всего встречающиеся темы/теги:** {tag_text}.",
+        f"**Основные источники негатива:** {negative_events_text}.",
     ]
     return "\n".join(f"• {line}" for line in lines)
 
@@ -963,7 +1013,7 @@ def render_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, perio
     else:
         st.caption("Автоматическое саммари сформировано по выбранному периоду и текущей структуре инфоповодов.")
 
-    st.markdown(summary_text.replace("\n", "  \n"))
+    st.markdown(format_dashboard_summary_markdown(summary_text).replace("\n", "  \n"))
 
     if not can_edit:
         return
@@ -1977,7 +2027,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.7: исправлен выбор целевого инфоповода при объединении")
+    st.caption("Версия 2.8: улучшен визуал саммари периода")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
