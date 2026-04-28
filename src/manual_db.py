@@ -114,6 +114,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (event_id, message_id)
         );
 
+        CREATE TABLE IF NOT EXISTS event_key_messages (
+            event_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            note TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (event_id, message_id)
+        );
+
         CREATE TABLE IF NOT EXISTS manual_events (
             event_id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -187,6 +195,14 @@ def get_message_exclusions(conn) -> pd.DataFrame:
     if is_supabase_conn(conn):
         return _payload_df(conn, "event_message_exclusions")
     return pd.read_sql_query("SELECT * FROM event_message_exclusions", conn)
+
+
+def get_key_message_pins(conn) -> pd.DataFrame:
+    """Return messages manually pinned as key for particular information events."""
+    if is_supabase_conn(conn):
+        return _payload_df(conn, "event_key_messages")
+    init_db(conn)
+    return pd.read_sql_query("SELECT * FROM event_key_messages", conn)
 
 
 def get_manual_events(conn) -> pd.DataFrame:
@@ -456,3 +472,48 @@ def restore_message_relevance(conn, event_id: str, message_id: str) -> None:
     conn.execute("DELETE FROM event_message_exclusions WHERE event_id = ? AND message_id = ?", (event_id, message_id))
     conn.commit()
     log(conn, "restore_message_relevance", "message", message_id, f"event={event_id}")
+
+
+def pin_key_message(conn, event_id: str, message_id: str, note: str = "") -> None:
+    """Pin a message as manually selected key message inside an information event."""
+    event_id = str(event_id or "").strip()
+    message_id = str(message_id or "").strip()
+    if not event_id or not message_id:
+        raise ValueError("Не удалось определить инфоповод или сообщение.")
+    payload = {
+        "event_id": event_id,
+        "message_id": message_id,
+        "note": str(note or ""),
+        "updated_at": now(),
+    }
+    if is_supabase_conn(conn):
+        _upsert_payload(conn, "event_key_messages", f"event_key_messages:{event_id}:{message_id}", payload)
+        log(conn, "pin_key_message", "message", message_id, f"event={event_id}; note={note}")
+        return
+    init_db(conn)
+    conn.execute(
+        """
+        INSERT INTO event_key_messages(event_id, message_id, note, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(event_id, message_id) DO UPDATE SET
+            note=excluded.note,
+            updated_at=excluded.updated_at
+        """,
+        (event_id, message_id, str(note or ""), now()),
+    )
+    conn.commit()
+    log(conn, "pin_key_message", "message", message_id, f"event={event_id}; note={note}")
+
+
+def unpin_key_message(conn, event_id: str, message_id: str) -> None:
+    """Remove a manual key-message pin from an information event."""
+    event_id = str(event_id or "").strip()
+    message_id = str(message_id or "").strip()
+    if is_supabase_conn(conn):
+        _delete_payload(conn, f"event_key_messages:{event_id}:{message_id}")
+        log(conn, "unpin_key_message", "message", message_id, f"event={event_id}")
+        return
+    init_db(conn)
+    conn.execute("DELETE FROM event_key_messages WHERE event_id = ? AND message_id = ?", (event_id, message_id))
+    conn.commit()
+    log(conn, "unpin_key_message", "message", message_id, f"event={event_id}")

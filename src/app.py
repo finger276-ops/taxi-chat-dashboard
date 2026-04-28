@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import os
 import re
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
@@ -33,6 +34,9 @@ from manual_db import (
     hide_message,
     mark_message_irrelevant,
     restore_message_relevance,
+    get_key_message_pins,
+    pin_key_message,
+    unpin_key_message,
     get_dashboard_summary,
     save_dashboard_summary,
 )
@@ -1316,22 +1320,224 @@ def event_table(events: pd.DataFrame) -> str | None:
     return table.iloc[0]["event_id"]
 
 
-def message_preview_cards(event_messages: pd.DataFrame, limit: int = 8):
+KEY_MESSAGE_STOPWORDS = {
+    "это", "как", "что", "или", "для", "при", "уже", "еще", "ещё", "там", "тут", "все", "всё",
+    "они", "она", "оно", "его", "ему", "вам", "вас", "нам", "нас", "про", "без", "под", "над",
+    "только", "так", "вот", "когда", "если", "где", "куда", "почему", "зачем", "тоже", "можно",
+    "нужно", "надо", "будет", "было", "были", "есть", "нет", "да", "ну", "же", "ли", "бы", "за",
+    "из", "от", "до", "по", "на", "не", "ни", "во", "со", "ко", "то", "вы", "мы", "он", "я",
+    "такси", "чат", "водитель", "водители", "сообщение", "сообщения", "тема", "обсуждение",
+}
+
+
+def _message_tokens(text: str) -> list[str]:
+    """Tokenize Russian/English text for representative-message scoring."""
+    normalized = str(text or "").lower().replace("ё", "е")
+    tokens = re.findall(r"[a-zа-я0-9]{3,}", normalized, flags=re.IGNORECASE)
+    return [t for t in tokens if t not in KEY_MESSAGE_STOPWORDS and not t.isdigit()]
+
+
+def _message_token_set(text: str) -> set[str]:
+    return set(_message_tokens(text))
+
+
+def _dedupe_key(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").lower().replace("ё", "е")).strip()
+    normalized = re.sub(r"[^a-zа-я0-9 ]+", "", normalized)
+    return normalized[:280]
+
+
+def _text_source_penalty(row: pd.Series) -> float:
+    source = str(row.get("text_source", "") or row.get("source", "")).lower()
+    text = str(row.get("text_clean", "") or "").lower()
+    penalty = 0.0
+    if any(x in source for x in ["ocr", "image", "изображ", "картин"]):
+        penalty -= 0.35
+    if any(x in text for x in ["тексты с изображений", "расшифровки"]):
+        penalty -= 0.25
+    return penalty
+
+
+def rank_key_messages(
+    event_messages: pd.DataFrame,
+    *,
+    event_title: str = "",
+    event_summary: str = "",
+    tags: str = "",
+    limit: int = 10,
+) -> pd.DataFrame:
+    """Return representative messages for an event.
+
+    The previous version prioritized negative + longest messages. This scorer keeps that signal,
+    but adds semantic relevance to the event title/summary, frequent words inside the event,
+    moderate text length, duplicate suppression and simple diversity.
+    """
+    if event_messages is None or event_messages.empty or "text_clean" not in event_messages.columns:
+        return event_messages.iloc[0:0].copy() if isinstance(event_messages, pd.DataFrame) else pd.DataFrame()
+
+    work = event_messages.copy()
+    work["_text"] = work["text_clean"].fillna("").astype(str).str.strip()
+    work = work[work["_text"].str.len() >= 18].copy()
+    if work.empty:
+        return event_messages.copy().head(limit)
+
+    topic_seed = " ".join([str(event_title or ""), str(event_summary or ""), str(tags or "").replace("|", " ")])
+    topic_tokens = set(_message_tokens(topic_seed))
+
+    all_tokens: list[str] = []
+    for txt in work["_text"].head(400).tolist():
+        all_tokens.extend(_message_tokens(txt))
+    frequent_tokens = {token for token, count in Counter(all_tokens).most_common(24) if count >= 2}
+    relevance_tokens = topic_tokens | frequent_tokens
+
+    rows = []
+    seen_best: dict[str, tuple[float, int]] = {}
+    for idx, row in work.iterrows():
+        text = row.get("_text", "")
+        text_len = len(text)
+        tokens = _message_token_set(text)
+        if not tokens:
+            continue
+
+        if text_len < 45:
+            length_score = 0.20
+        elif text_len <= 450:
+            length_score = 0.85 + min(text_len, 450) / 450 * 0.35
+        elif text_len <= 1200:
+            length_score = 1.05
+        else:
+            length_score = 0.70
+
+        overlap_topic = len(tokens & topic_tokens)
+        overlap_relevance = len(tokens & relevance_tokens)
+        topic_score = min(overlap_topic * 0.85, 3.4)
+        relevance_score = min(overlap_relevance * 0.28, 2.2)
+
+        sentiment = str(row.get("sentiment", "") or "").lower()
+        is_negative = False
+        if "is_negative" in row.index:
+            is_negative = str(row.get("is_negative", "")).lower() in {"true", "1", "yes", "да"}
+        is_negative = is_negative or any(x in sentiment for x in ["негатив", "negative", "отриц"])
+        negative_score = 1.15 if is_negative else 0.0
+
+        toxicity = str(row.get("toxicity", "") or row.get("Токсичность", "")).lower()
+        toxic_score = 0.45 if any(x in toxicity for x in ["токс", "toxic", "да", "true", "1"]) else 0.0
+
+        problem_score = 0.0
+        problem_words = {
+            "сбой", "ошибка", "ошибки", "проблема", "проблемы", "не работает",
+            "заблокировали", "блокировка", "налог", "закон", "коэффициент", "приоритет",
+            "оплата", "выплата", "штраф", "забастовка", "обновление", "тариф",
+        }
+        text_l = text.lower().replace("ё", "е")
+        for word in problem_words:
+            if word in text_l:
+                problem_score += 0.22
+        problem_score = min(problem_score, 1.1)
+
+        score = length_score + topic_score + relevance_score + negative_score + toxic_score + problem_score + _text_source_penalty(row)
+
+        if re.fullmatch(r"[а-яa-z0-9 ,.!?\-]{0,80}", text_l) and len(tokens) <= 4 and overlap_relevance == 0:
+            score -= 1.0
+
+        dedupe = _dedupe_key(text)
+        if not dedupe:
+            continue
+        if dedupe in seen_best:
+            old_score, old_idx = seen_best[dedupe]
+            if score > old_score:
+                seen_best[dedupe] = (score, idx)
+        else:
+            seen_best[dedupe] = (score, idx)
+        rows.append((idx, score, tokens))
+
+    if not rows:
+        return work.sort_values("datetime").head(limit) if "datetime" in work.columns else work.head(limit)
+
+    score_by_idx = {idx: score for idx, score, _ in rows}
+    token_by_idx = {idx: tokens for idx, _, tokens in rows}
+    duplicate_winners = {idx for _, idx in seen_best.values()}
+
+    candidates = [idx for idx in score_by_idx if idx in duplicate_winners]
+    candidates = sorted(candidates, key=lambda idx: score_by_idx[idx], reverse=True)
+
+    selected: list[int] = []
+    for idx in candidates:
+        tokens = token_by_idx.get(idx, set())
+        too_similar = False
+        for chosen in selected:
+            chosen_tokens = token_by_idx.get(chosen, set())
+            union = tokens | chosen_tokens
+            if union and len(tokens & chosen_tokens) / len(union) >= 0.72:
+                too_similar = True
+                break
+        if too_similar:
+            continue
+        selected.append(idx)
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < limit:
+        for idx in candidates:
+            if idx not in selected:
+                selected.append(idx)
+            if len(selected) >= limit:
+                break
+
+    result = work.loc[selected].copy()
+    result["_key_message_score"] = result.index.map(score_by_idx).fillna(0.0)
+    if "datetime" in result.columns:
+        return result.sort_values("datetime")
+    return result
+
+
+def message_preview_cards(
+    event_messages: pd.DataFrame,
+    limit: int = 8,
+    *,
+    event_title: str = "",
+    event_summary: str = "",
+    tags: str = "",
+    pinned_message_ids: set[str] | None = None,
+    conn=None,
+    event_id: str = "",
+    can_edit: bool = False,
+):
     if event_messages.empty:
         st.info("Сообщения не найдены.")
         return
 
+    pinned_message_ids = {str(x) for x in (pinned_message_ids or set()) if str(x).strip()}
     work = event_messages.copy()
-    work["text_len"] = work["text_clean"].fillna("").astype(str).str.len()
-    if "is_negative" in work.columns:
-        work["_rank_negative"] = work["is_negative"].astype(str).str.lower().isin(["true", "1"]).astype(int)
-    else:
-        work["_rank_negative"] = 0
+    work["message_id"] = work.get("message_id", "").astype(str)
 
-    sample = (
-        work.sort_values(["_rank_negative", "text_len"], ascending=False)
-        .head(limit)
-        .sort_values("datetime")
+    pinned_sample = work[work["message_id"].isin(pinned_message_ids)].copy()
+    auto_source = work[~work["message_id"].isin(pinned_message_ids)].copy()
+
+    auto_limit = max(0, limit - len(pinned_sample))
+    auto_sample = rank_key_messages(
+        auto_source,
+        event_title=event_title,
+        event_summary=event_summary,
+        tags=tags,
+        limit=auto_limit,
+    ) if auto_limit else auto_source.iloc[0:0].copy()
+
+    if not pinned_sample.empty:
+        pinned_sample["_manual_key"] = True
+        if "datetime" in pinned_sample.columns:
+            pinned_sample = pinned_sample.sort_values("datetime")
+    if not auto_sample.empty:
+        auto_sample["_manual_key"] = False
+
+    sample = pd.concat([pinned_sample, auto_sample], ignore_index=False) if not pinned_sample.empty else auto_sample
+
+    if sample.empty:
+        st.info("Не найдено достаточно информативных сообщений для этого инфоповода.")
+        return
+
+    st.caption(
+        "Закрепленные вручную сообщения показываются первыми. Остальные выбраны по близости к теме, частым словам внутри инфоповода, информативности текста, негативу и отсутствию дублей."
     )
 
     for _, row in sample.iterrows():
@@ -1341,18 +1547,29 @@ def message_preview_cards(event_messages: pd.DataFrame, limit: int = 8):
         text = str(row.get("text_clean", "")).strip()
         sentiment = str(row.get("sentiment", "")).strip()
         link = str(row.get("message_link", "")).strip()
+        message_id = str(row.get("message_id", "")).strip()
+        is_manual_key = bool(row.get("_manual_key", False))
+        badge = "<b>Закреплено вручную</b> · " if is_manual_key else ""
 
         st.markdown(
             f"""
 <div style="padding: 0.75rem 0; border-bottom: 1px solid rgba(128,128,128,.25);">
-  <div style="font-size: 0.88rem; opacity: .75;">{when} · {chat} · {author} · {sentiment}</div>
+  <div style="font-size: 0.88rem; opacity: .75;">{badge}{when} · {chat} · {author} · {sentiment}</div>
   <div style="margin-top: .25rem; white-space: pre-wrap;">{text[:1200]}</div>
 </div>
 """,
             unsafe_allow_html=True,
         )
+        cols = st.columns([1, 4]) if can_edit and is_manual_key and conn is not None and event_id and message_id else None
         if link.startswith("http"):
             st.markdown(f"[Открыть сообщение]({link})")
+        if cols:
+            with cols[0]:
+                if st.button("Убрать из ключевых", key=f"unpin_key_{event_id}_{message_id}"):
+                    unpin_key_message(conn, event_id, message_id)
+                    st.success("Сообщение удалено из ключевых.")
+                    st.cache_data.clear()
+                    st.rerun()
 
 
 def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame, conn, can_edit: bool = True):
@@ -1367,6 +1584,15 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         & (~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool))
     ].copy()
     event_messages = event_messages.sort_values("datetime")
+
+    pinned_messages = get_key_message_pins(conn)
+    if pinned_messages is not None and not pinned_messages.empty:
+        pinned_messages = pinned_messages.copy()
+        pinned_messages["event_id"] = pinned_messages.get("event_id", "").astype(str)
+        pinned_messages["message_id"] = pinned_messages.get("message_id", "").astype(str)
+        pinned_message_ids = set(pinned_messages.loc[pinned_messages["event_id"] == str(event_id), "message_id"].tolist())
+    else:
+        pinned_message_ids = set()
 
     st.markdown("---")
     st.header(ev["event_title"])
@@ -1390,7 +1616,17 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     tab_edit = tabs[2] if can_edit else None
 
     with tab_messages:
-        message_preview_cards(event_messages, limit=10)
+        message_preview_cards(
+            event_messages,
+            limit=10,
+            event_title=str(ev.get("event_title", "")),
+            event_summary=str(ev.get("event_summary", "")),
+            tags=tags,
+            pinned_message_ids=pinned_message_ids,
+            conn=conn,
+            event_id=event_id,
+            can_edit=can_edit,
+        )
 
     with tab_all:
         if event_messages.empty:
@@ -1425,8 +1661,9 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.markdown("#### Полный текст")
                 st.write(row.get("text_clean", ""))
                 if can_edit:
-                    with st.expander("Перенести, исключить или скрыть сообщение", expanded=False):
+                    with st.expander("Перенести, исключить, скрыть или пометить ключевым", expanded=False):
                         st.caption(
+                            "«Ключевое» закрепляет сообщение в разделе ключевых сообщений. "
                             "«Нерелевант» убирает сообщение только из текущего инфоповода. "
                             "Сообщение остается в базе и поиске."
                         )
@@ -1439,7 +1676,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                         current_idx = int(current_matches[0]) if current_matches else 0
                         target_label = st.selectbox("Перенести в инфоповод", target_options["label"].tolist(), index=current_idx)
                         msg_note = st.text_input("Комментарий", value="", key=f"msg_note_{event_id}_{row['message_id']}")
-                        col_a, col_b, col_c = st.columns(3)
+                        col_a, col_b, col_c, col_d = st.columns(4)
                         if col_a.button("Перенести", key=f"move_{event_id}_{row['message_id']}"):
                             target_id = target_options.loc[target_options["label"] == target_label, "event_id"].iloc[0]
                             move_message(conn, row["message_id"], target_id, note=msg_note)
@@ -1456,6 +1693,15 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                             st.success("Сообщение скрыто во всех разделах дашборда.")
                             st.cache_data.clear()
                             st.rerun()
+                        message_id_str = str(row["message_id"])
+                        already_key = message_id_str in pinned_message_ids
+                        if col_d.button("Ключевое", disabled=already_key, key=f"pin_key_{event_id}_{row['message_id']}"):
+                            pin_key_message(conn, event_id, row["message_id"], note=msg_note)
+                            st.success("Сообщение добавлено в ключевые.")
+                            st.cache_data.clear()
+                            st.rerun()
+                        if already_key:
+                            st.caption("Это сообщение уже закреплено как ключевое для текущего инфоповода.")
 
                         st.markdown("##### Создать новый инфоповод для этого сообщения")
                         st.caption("Если подходящей темы нет в списке, создайте новую — выбранное сообщение сразу будет перенесено туда.")
@@ -2027,7 +2273,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.8: улучшен визуал саммари периода")
+    st.caption("Версия 3.0: добавлена ручная отметка ключевых сообщений")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
