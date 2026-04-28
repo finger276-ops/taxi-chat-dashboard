@@ -800,14 +800,47 @@ def show_manual_event_creator(conn):
             st.rerun()
 
 
-def show_kpis(events: pd.DataFrame):
+def messages_for_events(messages: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    """Return visible messages that belong to the currently displayed events."""
+    if not isinstance(messages, pd.DataFrame) or messages.empty or not isinstance(events, pd.DataFrame) or events.empty:
+        return pd.DataFrame()
+    if "event_id" not in events.columns or "final_event_id" not in messages.columns:
+        return pd.DataFrame()
+    event_ids = set(events["event_id"].dropna().astype(str))
+    result = messages[messages["final_event_id"].astype(str).isin(event_ids)].copy()
+    if "message_hidden" in result.columns:
+        result = result[~result["message_hidden"].astype(bool)]
+    return result
+
+
+def show_kpis(events: pd.DataFrame, messages: pd.DataFrame | None = None):
+    visible_messages = messages.copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
+    if "message_hidden" in visible_messages.columns:
+        visible_messages = visible_messages[~visible_messages["message_hidden"].astype(bool)]
+
+    if not visible_messages.empty:
+        message_count = int(visible_messages["message_id"].nunique()) if "message_id" in visible_messages.columns else int(len(visible_messages))
+        chat_col = "chat_id" if "chat_id" in visible_messages.columns else "chat_title" if "chat_title" in visible_messages.columns else None
+        chat_count = int(visible_messages[chat_col].nunique()) if chat_col else 0
+        if "is_negative" in visible_messages.columns:
+            negative_count = int(visible_messages["is_negative"].astype(str).str.lower().isin(["true", "1", "yes", "да"]).sum())
+        elif "sentiment" in visible_messages.columns:
+            negative_count = int(visible_messages["sentiment"].astype(str).str.lower().str.contains("нег|neg", regex=True, na=False).sum())
+        else:
+            negative_count = 0
+    else:
+        message_count = int(events["message_count"].sum()) if len(events) and "message_count" in events.columns else 0
+        # Do not use max(chat_count): it undercounts multi-period selections.
+        # Sum is only a fallback when message-level data is unavailable.
+        chat_count = int(events["chat_count"].sum()) if len(events) and "chat_count" in events.columns else 0
+        negative_count = int(events["negative_count"].sum()) if len(events) and "negative_count" in events.columns else 0
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Инфоповодов", f"{len(events):,}".replace(",", " "))
-    c2.metric("Сообщений", f"{int(events['message_count'].sum()) if len(events) else 0:,}".replace(",", " "))
-    c3.metric("Чатов", int(events["chat_count"].max()) if len(events) else 0)
-    c4.metric("Негатив", format_pct(events["negative_count"].sum() / events["message_count"].sum()) if len(events) and events["message_count"].sum() else "0%")
-    c5.metric("Высокая важность", int((events["importance_score"] >= events["importance_score"].quantile(0.75)).sum()) if len(events) else 0)
-
+    c2.metric("Сообщений", f"{message_count:,}".replace(",", " "))
+    c3.metric("Чатов", f"{chat_count:,}".replace(",", " "))
+    c4.metric("Негатив", format_pct(negative_count / message_count) if message_count else "0%")
+    c5.metric("Высокая важность", int((events["importance_score"] >= events["importance_score"].quantile(0.75)).sum()) if len(events) and "importance_score" in events.columns else 0)
 
 def _split_pipe_values(series: pd.Series) -> list[str]:
     values: list[str] = []
@@ -838,11 +871,40 @@ def _summary_key(period_ids: list[str]) -> str:
 
 
 
-def _summary_period_range(messages) -> str:
-    """Return human-readable period range for summary without period title."""
+def _summary_period_range(messages, period_ids: list[str] | None = None) -> str:
+    """Return human-readable period range for summary without period title.
+
+    Prefer edited period metadata from Supabase. Message-level datetimes can be
+    partially empty or parsed differently across imported sources, so using only
+    messages may show the first selected period even when several periods are
+    selected.
+    """
+    if period_ids:
+        try:
+            periods = list_periods(include_inactive=True)
+            if isinstance(periods, pd.DataFrame) and not periods.empty and "period_id" in periods.columns:
+                selected = periods[periods["period_id"].astype(str).isin([str(x) for x in period_ids])].copy()
+                if not selected.empty:
+                    dates = []
+                    for col in ["date_from", "date_to"]:
+                        if col in selected.columns:
+                            parsed = pd.to_datetime(selected[col], errors="coerce", dayfirst=True).dropna()
+                            if not parsed.empty:
+                                dates.append(parsed.min())
+                                dates.append(parsed.max())
+                    if dates:
+                        start_s = format_date(min(dates))
+                        end_s = format_date(max(dates))
+                        if start_s and end_s and start_s != end_s:
+                            return f"{start_s} — {end_s}"
+                        if start_s:
+                            return start_s
+        except Exception:
+            pass
+
     if not isinstance(messages, pd.DataFrame) or messages.empty or "datetime" not in messages.columns:
         return "выбранный период"
-    dt = pd.to_datetime(messages["datetime"], errors="coerce").dropna()
+    dt = pd.to_datetime(messages["datetime"], errors="coerce", dayfirst=True).dropna()
     if dt.empty:
         return "выбранный период"
     start_s = format_date(dt.min())
@@ -853,6 +915,47 @@ def _summary_period_range(messages) -> str:
         return start_s
     return "выбранный период"
 
+
+def _first_summary_line(summary_text: str) -> str:
+    for line in str(summary_text or "").splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _sync_summary_first_line(summary_text: str, auto_summary: str) -> str:
+    """Keep manually saved summaries consistent with the current selected periods.
+
+    Editors may save custom wording for the body of the summary, but the first
+    line contains calculated metrics and selected period range. It should always
+    be generated from the current data to avoid stale single-period headers when
+    multiple periods are selected.
+    """
+    value = str(summary_text or "").strip()
+    auto_first = _first_summary_line(auto_summary)
+    if not value or not auto_first:
+        return value or auto_summary
+    lines = value.splitlines()
+    for idx, line in enumerate(lines):
+        if re.search(r"За период|За выбранный период", line):
+            lines[idx] = auto_first
+            return "\n".join(lines).strip()
+    return "\n".join([auto_first, value]).strip()
+
+
+def _events_grouped_by_title(events: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    if not isinstance(events, pd.DataFrame) or events.empty or "event_title" not in events.columns:
+        return pd.DataFrame(columns=["event_title", metric_col])
+    work = events.copy()
+    work["event_title"] = work["event_title"].fillna("").astype(str).str.strip()
+    work = work[work["event_title"] != ""]
+    if work.empty:
+        return pd.DataFrame(columns=["event_title", metric_col])
+    if metric_col not in work.columns:
+        work[metric_col] = 0
+    work[metric_col] = pd.to_numeric(work[metric_col], errors="coerce").fillna(0).astype(int)
+    return work.groupby("event_title", as_index=False)[metric_col].sum().sort_values(metric_col, ascending=False)
 
 def format_dashboard_summary_markdown(text: str) -> str:
     """Normalize summary display: remove legacy period title and bold leading labels."""
@@ -928,7 +1031,7 @@ def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, p
     if "is_hidden" in visible_events.columns:
         visible_events = visible_events[~visible_events["is_hidden"].astype(bool)]
 
-    period_range = _summary_period_range(visible_messages)
+    period_range = _summary_period_range(visible_messages, period_ids)
 
     if visible_messages.empty and visible_events.empty:
         return "**За выбранный период** данных для саммари пока недостаточно."
@@ -965,20 +1068,14 @@ def build_auto_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, p
 
     top_events_text = "нет выраженных тем"
     if not visible_events.empty and "event_title" in visible_events.columns:
-        event_metric = "message_count" if "message_count" in visible_events.columns else None
-        top_events = visible_events.copy()
-        if event_metric:
-            top_events[event_metric] = pd.to_numeric(top_events[event_metric], errors="coerce").fillna(0).astype(int)
-            top_events = top_events.sort_values(event_metric, ascending=False).head(6)
-            top_events_text = _format_top_items(list(zip(top_events["event_title"], top_events[event_metric])), limit=6)
-        else:
-            top_events_text = "; ".join(top_events["event_title"].dropna().astype(str).head(6).tolist())
+        top_events = _events_grouped_by_title(visible_events, "message_count")
+        if not top_events.empty:
+            top_events_text = _format_top_items(list(zip(top_events["event_title"], top_events["message_count"])), limit=6)
 
     negative_events_text = "нет выраженного негативного ядра"
     if not visible_events.empty and {"event_title", "negative_count"}.issubset(visible_events.columns):
-        neg_events = visible_events.copy()
-        neg_events["negative_count"] = pd.to_numeric(neg_events["negative_count"], errors="coerce").fillna(0).astype(int)
-        neg_events = neg_events[neg_events["negative_count"] > 0].sort_values("negative_count", ascending=False).head(5)
+        neg_events = _events_grouped_by_title(visible_events, "negative_count")
+        neg_events = neg_events[neg_events["negative_count"] > 0].head(5)
         if not neg_events.empty:
             negative_events_text = _format_top_items(list(zip(neg_events["event_title"], neg_events["negative_count"])))
 
@@ -1009,7 +1106,7 @@ def render_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, perio
     auto_summary = build_auto_dashboard_summary(events, messages, period_ids)
     saved = get_dashboard_summary(conn, key)
     saved_text = str(saved.get("summary", "") or "").strip() if isinstance(saved, dict) else ""
-    summary_text = saved_text or auto_summary
+    summary_text = _sync_summary_first_line(saved_text, auto_summary) if saved_text else auto_summary
 
     st.subheader("Саммари периода")
     if can_edit:
@@ -2288,7 +2385,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.1: технические подписи скрыты от пользовательского доступа")
+        st.caption("Версия 3.2: исправлены саммари и метрики при выборе нескольких периодов")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
@@ -2349,7 +2446,8 @@ def main():
     render_dashboard_summary(events, enriched_messages, selected_period_ids, conn, can_edit)
 
     filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
-    show_kpis(filtered_events)
+    filtered_messages = messages_for_events(enriched_messages, filtered_events)
+    show_kpis(filtered_events, filtered_messages)
     if word_query:
         word_message_results_table(word_matches, events, word_query)
     selected_event_id = event_table(filtered_events)
