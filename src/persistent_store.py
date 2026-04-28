@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -81,6 +82,35 @@ def safe_slug(value: str, fallback: str = "period") -> str:
     value = re.sub(r"[^0-9a-zа-я]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_")
     return value or fallback
+
+
+def ascii_storage_component(value: str, fallback: str = "file") -> str:
+    """Return a Supabase Storage-safe ASCII path component."""
+    value = str(value or "").strip()
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^0-9A-Za-z._-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("._-")
+    return value or fallback
+
+
+def safe_storage_filename(filename: str) -> str:
+    source = Path(filename or "upload.csv")
+    stem = ascii_storage_component(source.stem, "upload")[:120]
+    suffix = ascii_storage_component(source.suffix.lower().lstrip("."), "csv")
+    if suffix not in {"csv", "txt", "xlsx", "xls", "xlsm"}:
+        suffix = "csv"
+    return f"{stem}.{suffix}"
+
+
+def content_type_for_filename(filename: str) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".csv":
+        return "text/csv"
+    if suffix == ".xlsx":
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if suffix == ".xls":
+        return "application/vnd.ms-excel"
+    return "application/octet-stream"
 
 
 def make_period_id(period_name: str, source_filename: str = "") -> str:
@@ -291,10 +321,12 @@ def save_uploaded_csv_to_storage(period_id: str, filename: str, file_bytes: byte
     """
     client = get_supabase_client()
     bucket = _secret_value("SUPABASE_STORAGE_BUCKET") or "dashboard-csv"
-    clean_name = re.sub(r"[^0-9A-Za-zА-Яа-я_. -]+", "_", filename or "upload.csv")
-    path = f"{period_id}/{clean_name}"
+    safe_period = ascii_storage_component(period_id, "period")[:100]
+    safe_name = safe_storage_filename(filename)
+    digest = hashlib.md5(file_bytes or b"").hexdigest()[:8]
+    path = f"{safe_period}/{digest}_{safe_name}"
     try:
-        client.storage.from_(bucket).upload(path, file_bytes, {"content-type": "text/csv", "upsert": "true"})
+        client.storage.from_(bucket).upload(path, file_bytes, {"content-type": content_type_for_filename(filename), "upsert": "true"})
     except TypeError:
         client.storage.from_(bucket).upload(path, file_bytes)
     return path

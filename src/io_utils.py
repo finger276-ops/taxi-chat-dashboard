@@ -1,30 +1,23 @@
 """
-I/O helpers for CSV / Parquet tables.
+I/O helpers for source files and generated CSV / Parquet tables.
 """
 
 from pathlib import Path
 import pandas as pd
 
+from import_adapters import read_source_table
+
 
 def read_source_csv(path: str | Path) -> pd.DataFrame:
-    """Read Brand Analytics-like CSV with semicolon separator and embedded newlines."""
-    path = Path(path)
-    return pd.read_csv(
-        path,
-        sep=";",
-        encoding="utf-8-sig",
-        dtype=str,
-        keep_default_na=False,
-        engine="python",
-        on_bad_lines="warn",
-    )
+    """Backward-compatible source reader.
+
+    Despite the historical name, this now supports CSV and Excel exports from
+    Mediologia, Brand Analytics and generic tabular files.
+    """
+    return read_source_table(path)
 
 
 def write_table(df: pd.DataFrame, output_dir: str | Path, name: str) -> Path:
-    """
-    Write table as parquet when pyarrow/fastparquet is available.
-    Fallback to CSV otherwise.
-    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -42,7 +35,6 @@ def write_table(df: pd.DataFrame, output_dir: str | Path, name: str) -> Path:
 
 
 def read_table(data_dir: str | Path, name: str) -> pd.DataFrame:
-    """Read table saved by write_table."""
     data_dir = Path(data_dir)
     parquet_path = data_dir / f"{name}.parquet"
     csv_path = data_dir / f"{name}.csv"

@@ -64,7 +64,7 @@ def get_secret_value(name: str, default: str = "") -> str:
 
 
 def render_admin_mode() -> bool:
-    """Return True when user is allowed to upload CSV and edit/moderate data."""
+    """Return True when user is allowed to upload files and edit/moderate data."""
     admin_password = get_secret_value("ADMIN_PASSWORD", "")
 
     if "is_admin" not in st.session_state:
@@ -1316,12 +1316,13 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
 
 
 def safe_upload_name(filename: str) -> str:
-    name = Path(filename or "uploaded.csv").name
-    name = re.sub(r"[^0-9A-Za-zА-Яа-я_. -]+", "_", name)
-    if not name.lower().endswith(".csv"):
-        name += ".csv"
+    source = Path(filename or "uploaded.csv")
+    name = re.sub(r"[^0-9A-Za-zА-Яа-я_. -]+", "_", source.stem).strip("._-") or "uploaded"
+    suffix = source.suffix.lower()
+    if suffix not in {".csv", ".xlsx", ".xls", ".xlsm"}:
+        suffix = ".csv"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{stamp}_{name}"
+    return f"{stamp}_{name}{suffix}"
 
 
 def read_manifest(data_dir: Path) -> dict:
@@ -1345,7 +1346,7 @@ def render_period_selector() -> list[str]:
     """Render Supabase period selector and return selected period IDs."""
     periods = list_periods()
     if periods.empty:
-        st.sidebar.info("В Supabase пока нет сохраненных периодов. Загрузите CSV в разделе «Загрузка CSV».")
+        st.sidebar.info("В Supabase пока нет сохраненных периодов. Загрузите файл в разделе «Загрузка файла».")
         return []
 
     def period_label(row) -> str:
@@ -1369,16 +1370,16 @@ def render_period_selector() -> list[str]:
         st.sidebar.warning("Выберите хотя бы один период.")
     return selected
 def show_upload_page(data_dir: Path, upload_dir: Path):
-    st.subheader("Загрузка CSV нового периода")
+    st.subheader("Загрузка файла нового периода")
     st.write(
-        "Загрузите новый CSV-файл из Brand Analytics / Telegram-чатов. "
-        "Дашборд пересоберет сообщения, обсуждения и инфоповоды прямо из интерфейса."
+        "Загрузите новый CSV или Excel-файл из Brand Analytics, Медиалогии или другой системы. "
+        "Дашборд приведет данные к единому формату и пересоберет сообщения, обсуждения и инфоповоды."
     )
 
     persistent_enabled = supabase_configured()
     selected_period_ids: list[str] = []
     if persistent_enabled:
-        st.success("Постоянное хранение включено: CSV и обработанные периоды будут сохраняться в Supabase.")
+        st.success("Постоянное хранение включено: исходные файлы и обработанные периоды будут сохраняться в Supabase.")
     else:
         st.warning(
             "Supabase не настроен. Загруженные файлы и пересчитанные таблицы сохранятся только в текущем runtime Streamlit Cloud "
@@ -1402,16 +1403,16 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
     mode = st.radio(
         "Режим загрузки",
         [
-            "Заменить текущую выборку новым CSV",
-            "Добавить CSV в историю загрузок и пересобрать все загруженные периоды",
+            "Заменить текущую выборку новым файлом",
+            "Добавить файл в историю загрузок и пересобрать все загруженные периоды",
         ],
         help=(
-            "В режиме добавления дашборд объединит все CSV из папки data/uploads. "
-            "Если исходный CSV старого периода не был загружен в историю, он не попадет в пересборку."
+            "В режиме добавления дашборд объединит все CSV/Excel-файлы из папки data/uploads. "
+            "Если исходный файл старого периода не был загружен в историю, он не попадет в пересборку."
         ),
     )
 
-    uploaded = st.file_uploader("CSV-файл нового периода", type=["csv"])
+    uploaded = st.file_uploader("Файл нового периода", type=["csv", "xlsx", "xls", "xlsm"])
 
     with st.expander("Параметры алгоритма", expanded=False):
         col1, col2 = st.columns(2)
@@ -1432,7 +1433,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
         saved_path.write_bytes(uploaded.getbuffer())
 
         try:
-            with st.spinner("Читаю CSV и пересобираю инфоповоды…"):
+            with st.spinner("Читаю файл и пересобираю инфоповоды…"):
                 if persistent_enabled or mode.startswith("Заменить"):
                     manifest = run_preprocess(
                         input_path=saved_path,
@@ -1444,7 +1445,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
                         event_window_hours=float(event_window_hours),
                     )
                 else:
-                    csv_paths = sorted(upload_dir.glob("*.csv"))
+                    csv_paths = sorted([p for p in upload_dir.iterdir() if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}])
                     raw_parts = []
                     used_files = []
                     for path in csv_paths:
@@ -1454,7 +1455,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
                         except Exception as e:
                             st.warning(f"Файл {path.name} пропущен: {e}")
                     if not raw_parts:
-                        st.error("Не удалось прочитать ни один CSV-файл.")
+                        st.error("Не удалось прочитать ни один файл.")
                         return
                     combined = pd.concat(raw_parts, ignore_index=True)
                     manifest = run_preprocess_from_dataframe(
@@ -1484,7 +1485,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
                     try:
                         save_uploaded_csv_to_storage(period_id, uploaded.name, bytes(uploaded.getbuffer()))
                     except Exception as storage_error:
-                        st.warning(f"Обработанные данные сохранены в Supabase, но сырой CSV не удалось сохранить в Storage: {storage_error}")
+                        st.warning(f"Обработанные данные сохранены в Supabase, но исходный файл не удалось сохранить в Storage: {storage_error}")
                 st.success(f"Период сохранен в Supabase: {period_title}")
 
             st.cache_data.clear()
@@ -1498,10 +1499,10 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
             if st.button("Открыть обновленные инфоповоды"):
                 st.rerun()
         except Exception as e:
-            st.error("Не удалось обработать CSV.")
+            st.error("Не удалось обработать файл.")
             st.exception(e)
 
-    with st.expander("История загруженных CSV", expanded=False):
+    with st.expander("История загруженных файлов", expanded=False):
         if persistent_enabled:
             try:
                 periods = list_periods()
@@ -1527,7 +1528,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
             upload_dir.mkdir(parents=True, exist_ok=True)
             files = sorted(upload_dir.glob("*.csv"), reverse=True)
             if not files:
-                st.write("Пока нет загруженных CSV-файлов.")
+                st.write("Пока нет загруженных файлов.")
             else:
                 history = pd.DataFrame({
                     "Файл": [f.name for f in files],
@@ -1535,7 +1536,7 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
                     "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
                 })
                 st.dataframe(history, use_container_width=True, hide_index=True)
-                if st.button("Очистить историю загруженных CSV"):
+                if st.button("Очистить историю загруженных файлов"):
                     for f in files:
                         f.unlink(missing_ok=True)
                     st.success("История загрузок очищена.")
@@ -1552,7 +1553,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.1: дашборд переименован в «Дайджест водительских чатов»")
+    st.caption("Версия 2.2: добавлен универсальный импорт CSV/Excel из Медиалогии, Brand Analytics и других систем")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
@@ -1566,10 +1567,10 @@ def main():
         st.sidebar.info("Хранилище: локальные файлы")
 
     can_edit = render_admin_mode()
-    pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка CSV"] if can_edit else [])
+    pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
-    if page == "Загрузка CSV":
+    if page == "Загрузка файла":
         show_upload_page(data_dir, upload_dir)
         return
 
@@ -1579,7 +1580,7 @@ def main():
         try:
             selected_period_ids = render_period_selector()
             if not selected_period_ids:
-                st.info("Пока нет выбранных периодов. Откройте «Загрузка CSV» и сохраните первый период в Supabase.")
+                st.info("Пока нет выбранных периодов. Откройте «Загрузка файла» и сохраните первый период в Supabase.")
                 st.stop()
             events_raw, discussions, messages, discussion_messages, event_discussions = load_generated_tables_remote(tuple(selected_period_ids))
         except Exception as e:
@@ -1589,7 +1590,7 @@ def main():
     else:
         if not data_dir.exists():
             st.error(f"Папка с обработанными данными не найдена: {data_dir}")
-            st.info("Откройте раздел «Загрузка CSV» и загрузите исходный файл для первой сборки дашборда.")
+            st.info("Откройте раздел «Загрузка файла» и загрузите исходный файл для первой сборки дашборда.")
             st.stop()
         events_raw, discussions, messages, discussion_messages, event_discussions = load_generated_tables(str(data_dir))
 
@@ -1618,7 +1619,7 @@ def main():
     if can_edit:
         show_manual_event_creator(conn)
     else:
-        st.sidebar.caption("Загрузка CSV и ручная модерация доступны после входа администратора.")
+        st.sidebar.caption("Загрузка файлов и ручная модерация доступны после входа администратора.")
 
     if persistent_enabled and len(selected_period_ids) >= 2:
         render_period_comparison(enriched_messages, selected_period_ids)

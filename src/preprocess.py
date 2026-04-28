@@ -93,6 +93,7 @@ def clean_text(message: str, recognized: str) -> tuple[str, str]:
 
     for prefix in TEXT_PREFIXES_TO_REMOVE:
         text = text.replace(prefix, "")
+    text = text.replace("_x000D_", "\n")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = normalize_spaces(text)
 
@@ -118,12 +119,57 @@ def detect_tag_columns(df: pd.DataFrame) -> list[str]:
     return [col for col in TAG_COLUMNS_DEFAULT if col in df.columns]
 
 
+def split_tag_text(value: str) -> list[str]:
+    value = normalize_spaces(value)
+    if not value or value in {"49", "n/a", "N/A", "нет", "Нет"}:
+        return []
+    parts = re.split(r"[|;,\n]+", value)
+    tags = []
+    for part in parts:
+        tag = normalize_spaces(part)
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
 def row_tags(row: pd.Series, tag_cols: list[str]) -> list[str]:
     tags = []
     for tag in tag_cols:
         val = str(row.get(tag, "")).strip().lower()
         if val in {"да", "yes", "true", "1", "+"}:
             tags.append(tag)
+
+    for col in ["Теги", "Категории", "Сюжет"]:
+        for tag in split_tag_text(row.get(col, "")):
+            if tag not in tags:
+                tags.append(tag)
+
+    return tags
+
+
+def infer_display_tags(text: str, microtopic: str, source_tags: list[str]) -> list[str]:
+    tags = [tag for tag in source_tags if normalize_spaces(tag)]
+    micro_map = {
+        "strike": ["Забастовка"],
+        "wb_launch": ["WB Такси"],
+        "fasten_service": ["Фастен"],
+        "tax_law": ["Законы и налоги"],
+        "app_bug": ["Приложение и сбои"],
+        "app_orders": ["Приложение и сбои"],
+        "payments": ["Оплата и выплаты"],
+        "account_block": ["Блокировки и доступ"],
+        "child_seat": ["Детские кресла"],
+        "coeff_priority": ["Коэффициент"],
+        "airport": ["Аэропорты"],
+        "gps_map": ["Карты и навигация"],
+        "support": ["Поддержка и таксопарки"],
+        "general_yandex": ["яндекс"],
+    }
+    for tag in micro_map.get(str(microtopic or "other"), []):
+        if tag not in tags:
+            tags.append(tag)
+    if not tags:
+        tags.append("Без тега")
     return tags
 
 
@@ -166,7 +212,7 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
     link_series = get_text_series(
         df,
         "Ссылка",
-        aliases=["URL", "url", "message_link", "Ссылка на сообщение"],
+        aliases=["URL", "Url", "url", "message_link", "Ссылка на сообщение"],
     )
     source_id = id_series.where(id_series.str.strip() != "", link_series)
     df["message_id"] = [
@@ -207,9 +253,7 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
         for i, (profile, author) in enumerate(zip(author_profile, author_name))
     ]
 
-    tag_lists = df.apply(lambda r: row_tags(r, tag_cols), axis=1)
-    df["tags"] = ["|".join(tags) for tags in tag_lists]
-    df["tag_count"] = [len(tags) for tags in tag_lists]
+    raw_tag_lists = df.apply(lambda r: row_tags(r, tag_cols), axis=1)
 
     # Narrow rule-based topic used before clustering. For very short replies,
     # include a small parent-post context, but do not let parent text dominate.
@@ -220,17 +264,28 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
     ).str.slice(0, 300)
     df["microtopic"] = [
         classify_microtopic((text if len(str(text)) > 45 else f"{text} {parent}"), tags)
-        for text, parent, tags in zip(df["text_clean"].astype(str), parent_context, df["tags"].astype(str))
+        for text, parent, tags in zip(df["text_clean"].astype(str), parent_context, ["|".join(tags) for tags in raw_tag_lists])
     ]
 
-    def as_int(col_name: str) -> pd.Series:
-        if col_name not in df.columns:
-            return pd.Series([0] * len(df), index=df.index)
-        return pd.to_numeric(df[col_name].str.replace(",", ".", regex=False), errors="coerce").fillna(0).astype(int)
+    tag_lists = [
+        infer_display_tags(text, microtopic, tags)
+        for text, microtopic, tags in zip(df["text_clean"].astype(str), df["microtopic"].astype(str), raw_tag_lists)
+    ]
+    df["tags"] = ["|".join(tags) for tags in tag_lists]
+    df["tag_count"] = [len(tags) for tags in tag_lists]
 
-    df["duplicate_count"] = as_int("Количество дублей")
+    def as_int(*col_names: str) -> pd.Series:
+        series = pd.Series([0] * len(df), index=df.index, dtype="object")
+        for col_name in col_names:
+            if col_name in df.columns:
+                series = df[col_name].fillna("").astype(str)
+                break
+        series = series.str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
+        return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
+
+    df["duplicate_count"] = as_int("Количество дублей", "Дублей")
     df["views"] = as_int("Просмотры")
-    df["engagement"] = as_int("Вовлечённость")
+    df["engagement"] = as_int("Вовлечённость", "Вовлеченность")
 
     sentiment_series = get_text_series(df, "Тональность", aliases=["sentiment", "Окраска", "Тон"])
     toxicity_series = get_text_series(df, "Токсичность", aliases=["toxicity", "toxic"])
@@ -274,6 +329,8 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
         "tags": "tags",
         "tag_count": "tag_count",
         "microtopic": "microtopic",
+        "source_system": "source_system",
+        "source_file": "source_file",
         "is_negative": "is_negative",
         "is_toxic": "is_toxic",
     }
@@ -340,13 +397,13 @@ def classify_microtopic(text: str, tags: str | Iterable[str] = "") -> str:
     # Money and account issues.
     if regex_any(t, [r"оплат\w*", r"выплат\w*", r"деньг\w*", r"перевод\w*", r"задолж\w*", r"баланс\w*", r"комисс\w*"]):
         return "payments"
-    if regex_any(t, [r"блокир\w*", r"заблок\w*", r"\bбан\b", r"аккаунт\w*", r"доступ\w*", r"деактив\w*", r"профил\w*", r"самозанят\w*\s+не\s+подтверж"]):
+    if regex_any(t, [r"блокир\w*", r"заблок\w*", r"\bбан\b", r"аккаунт\w*", r"доступ\s+(?:к\s+)?(?:аккаунт\w*|профил\w*|яндекс\w*)", r"деактив\w*", r"профил\w*\s+(?:заблок|не\s+работ|отключ)", r"самозанят\w*\s+не\s+подтверж"]):
         return "account_block"
 
     # Operational subtopics.
     if regex_any(t, [r"кресл\w*", r"детск\w+", r"ребен\w*", r"ребенк\w*", r"бустер\w*"]):
         return "child_seat"
-    if "Коэффициент" in tag_values or regex_any(t, [r"коэф\w*", r"коэффициент\w*", r"\bкэф\w*", r"приоритет\w*", r"тариф\w*", r"ценник\w*", r"стоимост\w*", r"подач\w*", r"комфорт", r"эконом"]):
+    if "Коэффициент" in tag_values or regex_any(t, [r"коэф\w*", r"коэффициент\w*", r"\bкэф\w*", r"приоритет\w*", r"тариф\w*", r"ценник\w*", r"подач\w*"]):
         return "coeff_priority"
     if regex_any(t, [r"аэропорт\w*", r"пулково", r"шереметьево", r"внуково", r"домодедово"]):
         return "airport"
