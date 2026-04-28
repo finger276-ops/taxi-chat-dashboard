@@ -189,7 +189,13 @@ def _fetch_all(client: Client, table: str, *, filters: dict[str, Any] | None = N
     return rows
 
 
-def list_periods() -> pd.DataFrame:
+def list_periods(include_inactive: bool = False) -> pd.DataFrame:
+    """Return uploaded periods from Supabase.
+
+    By default only active periods are returned for dashboard filters.
+    The history manager passes include_inactive=True to show hidden/archived
+    periods as well. Periods with status=deleted are treated as removed.
+    """
     client = get_supabase_client()
     rows = _fetch_all(client, "dashboard_periods", order="uploaded_at")
     df = pd.DataFrame(rows)
@@ -197,6 +203,13 @@ def list_periods() -> pd.DataFrame:
         for col in ["date_from", "date_to", "uploaded_at"]:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+        if "status" not in df.columns:
+            df["status"] = "active"
+        df["status"] = df["status"].fillna("active").astype(str)
+        if not include_inactive:
+            df = df[df["status"].str.lower().isin(["active", "активный", ""])]
+        else:
+            df = df[~df["status"].str.lower().isin(["deleted", "удален", "удалён"])]
         df = df.sort_values("uploaded_at", ascending=False)
     return df
 
@@ -309,6 +322,77 @@ def save_processed_tables_from_dir(
         manifest=manifest,
         replace=replace,
     )
+
+
+def _normalize_date_for_db(value: Any) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    dt = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return None
+    return dt.date().isoformat()
+
+
+def get_period(period_id: str) -> dict[str, Any] | None:
+    client = get_supabase_client()
+    response = client.table("dashboard_periods").select("*").eq("period_id", period_id).limit(1).execute()
+    data = response.data or []
+    return data[0] if data else None
+
+
+def update_period_metadata(
+    period_id: str,
+    *,
+    period_name: str | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+    source_filename: str | None = None,
+    status: str | None = None,
+    manifest_updates: dict[str, Any] | None = None,
+) -> None:
+    """Update editable period metadata without touching generated rows."""
+    payload: dict[str, Any] = {}
+    if period_name is not None:
+        payload["period_name"] = str(period_name).strip() or period_id
+    if date_from is not None:
+        payload["date_from"] = _normalize_date_for_db(date_from)
+    if date_to is not None:
+        payload["date_to"] = _normalize_date_for_db(date_to)
+    if source_filename is not None:
+        payload["source_filename"] = str(source_filename).strip()
+    if status is not None:
+        payload["status"] = str(status).strip() or "active"
+
+    if manifest_updates:
+        current = get_period(period_id) or {}
+        manifest = current.get("manifest") or {}
+        if not isinstance(manifest, dict):
+            manifest = {}
+        manifest.update(manifest_updates)
+        payload["manifest"] = manifest
+
+    if not payload:
+        return
+    client = get_supabase_client()
+    client.table("dashboard_periods").update(payload).eq("period_id", period_id).execute()
+
+
+def set_period_status(period_id: str, status: str) -> None:
+    update_period_metadata(period_id, status=status)
+
+
+def delete_period(period_id: str, *, hard: bool = False) -> None:
+    """Soft-hide or permanently delete a period.
+
+    Hard delete removes dashboard_periods and generated table rows via cascade.
+    Manual rows are intentionally left intact, because they can include global
+    moderator notes; orphaned records are ignored by the dashboard.
+    """
+    client = get_supabase_client()
+    if hard:
+        client.table("dashboard_periods").delete().eq("period_id", period_id).execute()
+    else:
+        set_period_status(period_id, "hidden")
 
 
 def save_uploaded_csv_to_storage(period_id: str, filename: str, file_bytes: bytes) -> str:

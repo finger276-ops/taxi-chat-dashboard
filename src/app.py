@@ -42,6 +42,9 @@ from persistent_store import (
     save_processed_tables_from_dir,
     make_period_id,
     save_uploaded_csv_to_storage,
+    update_period_metadata,
+    set_period_status,
+    delete_period,
 )
 
 
@@ -568,6 +571,22 @@ def format_date(value) -> str:
 def format_date_series(series: pd.Series) -> pd.Series:
     """Format pandas datetime/string series as DD.MM.YYYY strings for display tables."""
     return pd.to_datetime(series, errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
+
+
+def period_note_from_manifest(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("period_note", "") or "")
+    return ""
+
+
+def parse_user_date(value: str):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    dt = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return None
+    return dt.date().isoformat()
 
 
 def format_period(row: pd.Series) -> str:
@@ -1369,6 +1388,157 @@ def render_period_selector() -> list[str]:
     if not selected:
         st.sidebar.warning("Выберите хотя бы один период.")
     return selected
+def render_period_history_manager(persistent_enabled: bool, upload_dir: Path):
+    """Show and edit uploaded periods/files history."""
+    st.markdown("### История загруженных файлов")
+
+    if not persistent_enabled:
+        st.info("Supabase не настроен. В локальном режиме можно только посмотреть файлы в папке загрузок.")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted([p for p in upload_dir.iterdir() if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}], reverse=True)
+        if not files:
+            st.write("Пока нет загруженных файлов.")
+            return
+        history = pd.DataFrame({
+            "Файл": [f.name for f in files],
+            "Размер, КБ": [round(f.stat().st_size / 1024, 1) for f in files],
+            "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
+        })
+        st.dataframe(history, use_container_width=True, hide_index=True)
+        if st.button("Очистить локальную историю загруженных файлов"):
+            for f in files:
+                f.unlink(missing_ok=True)
+            st.success("Локальная история загрузок очищена.")
+            st.rerun()
+        return
+
+    try:
+        periods = list_periods(include_inactive=True)
+    except Exception as e:
+        st.warning(f"Не удалось получить историю периодов из Supabase: {e}")
+        return
+
+    if periods.empty:
+        st.write("Пока нет сохраненных периодов в Supabase.")
+        return
+
+    view = periods.copy().reset_index(drop=True)
+    for col in ["date_from", "date_to", "uploaded_at"]:
+        if col in view.columns:
+            view[col] = pd.to_datetime(view[col], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
+    if "manifest" in view.columns:
+        view["period_note"] = view["manifest"].apply(period_note_from_manifest)
+    else:
+        view["period_note"] = ""
+
+    display_cols = [c for c in ["period_name", "date_from", "date_to", "source_filename", "uploaded_at", "status", "period_note"] if c in view.columns]
+    display = view[display_cols].rename(columns={
+        "period_name": "Название периода",
+        "date_from": "Начало",
+        "date_to": "Конец",
+        "source_filename": "Файл",
+        "uploaded_at": "Загружено",
+        "status": "Статус",
+        "period_note": "Комментарий",
+    })
+
+    event = st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        height=320,
+        selection_mode="single-row",
+        on_select="rerun",
+    )
+    rows = get_selected_rows(event)
+    if not rows:
+        st.caption("Выберите строку в таблице, чтобы изменить название периода, даты, статус или комментарий.")
+        return
+
+    selected = periods.reset_index(drop=True).iloc[rows[0]].to_dict()
+    period_id = str(selected.get("period_id", ""))
+    st.markdown("#### Редактирование выбранного периода")
+    st.caption(f"Внутренний ID: `{period_id}`")
+
+    current_manifest = selected.get("manifest") or {}
+    if not isinstance(current_manifest, dict):
+        current_manifest = {}
+
+    date_from_s = format_date(selected.get("date_from"))
+    date_to_s = format_date(selected.get("date_to"))
+    status_options = ["active", "hidden", "archived"]
+    current_status = str(selected.get("status") or "active")
+    if current_status not in status_options:
+        status_options.append(current_status)
+
+    with st.form(f"period_edit_form_{period_id}"):
+        c1, c2 = st.columns(2)
+        new_name = c1.text_input("Название периода", value=str(selected.get("period_name") or ""))
+        new_source = c2.text_input("Название исходного файла", value=str(selected.get("source_filename") or ""))
+        d1, d2 = st.columns(2)
+        new_date_from = d1.text_input("Дата начала", value=date_from_s, help="Формат: ДД.ММ.ГГГГ")
+        new_date_to = d2.text_input("Дата окончания", value=date_to_s, help="Формат: ДД.ММ.ГГГГ")
+        new_status = st.selectbox(
+            "Статус периода",
+            status_options,
+            index=status_options.index(current_status),
+            help="active — показывать в фильтре периодов; hidden/archived — скрыть из основного фильтра, но оставить в истории.",
+        )
+        new_note = st.text_area("Комментарий к периоду", value=str(current_manifest.get("period_note", "") or ""), height=90)
+        submitted = st.form_submit_button("Сохранить изменения", type="primary")
+
+    if submitted:
+        parsed_from = parse_user_date(new_date_from)
+        parsed_to = parse_user_date(new_date_to)
+        if new_date_from.strip() and not parsed_from:
+            st.error("Не удалось распознать дату начала. Используйте формат ДД.ММ.ГГГГ.")
+            return
+        if new_date_to.strip() and not parsed_to:
+            st.error("Не удалось распознать дату окончания. Используйте формат ДД.ММ.ГГГГ.")
+            return
+        try:
+            update_period_metadata(
+                period_id,
+                period_name=new_name,
+                date_from=parsed_from,
+                date_to=parsed_to,
+                source_filename=new_source,
+                status=new_status,
+                manifest_updates={"period_note": new_note},
+            )
+            st.cache_data.clear()
+            st.success("Данные периода обновлены.")
+            st.rerun()
+        except Exception as e:
+            st.error("Не удалось сохранить изменения периода.")
+            st.exception(e)
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Скрыть из фильтра", key=f"hide_period_{period_id}"):
+        set_period_status(period_id, "hidden")
+        st.cache_data.clear()
+        st.success("Период скрыт из основного фильтра.")
+        st.rerun()
+    if c2.button("Вернуть в фильтр", key=f"activate_period_{period_id}"):
+        set_period_status(period_id, "active")
+        st.cache_data.clear()
+        st.success("Период снова активен.")
+        st.rerun()
+
+    with st.expander("Удаление периода", expanded=False):
+        st.warning("Полное удаление уберет период и его обработанные строки из Supabase. Это действие нельзя отменить из дашборда.")
+        confirm_delete = st.checkbox("Я понимаю, что период будет удален полностью", key=f"confirm_delete_period_{period_id}")
+        if st.button("Удалить период полностью", disabled=not confirm_delete, key=f"hard_delete_period_{period_id}"):
+            try:
+                delete_period(period_id, hard=True)
+                st.cache_data.clear()
+                st.success("Период удален.")
+                st.rerun()
+            except Exception as e:
+                st.error("Не удалось удалить период.")
+                st.exception(e)
+
+
 def show_upload_page(data_dir: Path, upload_dir: Path):
     st.subheader("Загрузка файла нового периода")
     st.write(
@@ -1502,45 +1672,8 @@ def show_upload_page(data_dir: Path, upload_dir: Path):
             st.error("Не удалось обработать файл.")
             st.exception(e)
 
-    with st.expander("История загруженных файлов", expanded=False):
-        if persistent_enabled:
-            try:
-                periods = list_periods()
-                if periods.empty:
-                    st.write("Пока нет сохраненных периодов в Supabase.")
-                else:
-                    view = periods.copy()
-                    for col in ["date_from", "date_to", "uploaded_at"]:
-                        if col in view.columns:
-                            view[col] = pd.to_datetime(view[col], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
-                    cols = [c for c in ["period_name", "date_from", "date_to", "source_filename", "uploaded_at", "status"] if c in view.columns]
-                    st.dataframe(view[cols].rename(columns={
-                        "period_name": "Период",
-                        "date_from": "Начало",
-                        "date_to": "Конец",
-                        "source_filename": "Файл",
-                        "uploaded_at": "Загружено",
-                        "status": "Статус",
-                    }), use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.warning(f"Не удалось получить историю периодов из Supabase: {e}")
-        else:
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            files = sorted(upload_dir.glob("*.csv"), reverse=True)
-            if not files:
-                st.write("Пока нет загруженных файлов.")
-            else:
-                history = pd.DataFrame({
-                    "Файл": [f.name for f in files],
-                    "Размер, КБ": [round(f.stat().st_size / 1024, 1) for f in files],
-                    "Дата загрузки": [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m.%Y") for f in files],
-                })
-                st.dataframe(history, use_container_width=True, hide_index=True)
-                if st.button("Очистить историю загруженных файлов"):
-                    for f in files:
-                        f.unlink(missing_ok=True)
-                    st.success("История загрузок очищена.")
-                    st.rerun()
+    with st.expander("История и редактирование загруженных файлов", expanded=False):
+        render_period_history_manager(persistent_enabled, upload_dir)
 
 
 def main():
@@ -1553,7 +1686,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.2: добавлен универсальный импорт CSV/Excel из Медиалогии, Brand Analytics и других систем")
+    st.caption("Версия 2.3: добавлено редактирование истории загруженных файлов и периодов")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
