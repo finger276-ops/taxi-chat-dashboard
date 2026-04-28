@@ -465,6 +465,15 @@ def apply_manual_edits(
     else:
         enriched_messages["message_hidden"] = False
 
+    # If an uploaded file contains a human/external relevance column, exclude
+    # non-relevant messages from generated info events and summaries without
+    # deleting them from the stored message base.
+    if "source_relevant" in enriched_messages.columns:
+        relevant_mask = enriched_messages["source_relevant"].astype(str).str.lower().isin(["true", "1", "yes", "да"])
+        # Empty values mean that the file did not provide relevance markup.
+        empty_rel = enriched_messages["source_relevant"].astype(str).str.strip().eq("")
+        enriched_messages["message_hidden"] = enriched_messages["message_hidden"].astype(bool) | (~relevant_mask & ~empty_rel)
+
     rows = []
     for final_id, group in events.groupby("final_event_id", sort=False):
         target = events[events["event_id"] == final_id]
@@ -478,6 +487,37 @@ def apply_manual_edits(
         if len(group_messages) and "tags" in group_messages.columns:
             message_tags = sorted(set(t for tags in group_messages["tags"].fillna("") for t in str(tags).split("|") if t.strip()))
             all_tags = sorted(set(all_tags) | set(message_tags))
+
+        all_source_main_topics = sorted(set(
+            t.strip()
+            for topics in group.get("source_main_topic", pd.Series(dtype=str)).fillna("")
+            for t in str(topics).split(";")
+            if t.strip()
+        ))
+        if len(group_messages) and "source_main_topic" in group_messages.columns:
+            msg_source_topics = sorted(set(
+                t.strip()
+                for topics in group_messages["source_main_topic"].fillna("")
+                for t in str(topics).split(";")
+                if t.strip()
+            ))
+            all_source_main_topics = sorted(set(all_source_main_topics) | set(msg_source_topics))
+
+        all_source_topics = sorted(set(
+            t.strip()
+            for topics in group.get("source_topics", pd.Series(dtype=str)).fillna("")
+            for t in re.split(r"[;|]", str(topics))
+            if t.strip()
+        ))
+        if len(group_messages) and "source_topics" in group_messages.columns:
+            msg_source_topics_all = sorted(set(
+                t.strip()
+                for topics in group_messages["source_topics"].fillna("")
+                for t in re.split(r"[;|]", str(topics))
+                if t.strip()
+            ))
+            all_source_topics = sorted(set(all_source_topics) | set(msg_source_topics_all))
+
         keywords = sorted(set(t for tags in group.get("keywords", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
         phrases = sorted(set(t for tags in group.get("key_phrases", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
 
@@ -510,6 +550,8 @@ def apply_manual_edits(
             "event_summary": event_summary,
             "main_tag": base.get("main_tag", ""),
             "main_tags": "|".join(all_tags),
+            "source_main_topics": "; ".join(all_source_main_topics),
+            "source_topics": "; ".join(all_source_topics),
             "keywords": "|".join(keywords),
             "key_phrases": "|".join(phrases),
             "start_date": start_date,
@@ -709,6 +751,18 @@ def apply_filters(events: pd.DataFrame, messages: pd.DataFrame) -> tuple[pd.Data
     all_tags = sorted(set(t for tags in filtered.get("main_tags", pd.Series(dtype=str)).fillna("") for t in str(tags).split("|") if t.strip()))
     selected_tags = st.sidebar.multiselect("Теги", all_tags)
 
+    all_source_topics = sorted(set(
+        t.strip()
+        for topics in filtered.get("source_main_topics", pd.Series(dtype=str)).fillna("")
+        for t in str(topics).split(";")
+        if t.strip()
+    ))
+    selected_source_topics = st.sidebar.multiselect(
+        "Тема из файла",
+        all_source_topics,
+        help="Появляется, если в загруженной выгрузке есть колонка «Основная тема». Используется как верхний тематический слой.",
+    ) if all_source_topics else []
+
     statuses = [s for s in STATUS_OPTIONS if s in set(filtered.get("status", pd.Series(dtype=str)).fillna("").astype(str))]
     selected_statuses = st.sidebar.multiselect("Статус", statuses)
 
@@ -735,6 +789,14 @@ def apply_filters(events: pd.DataFrame, messages: pd.DataFrame) -> tuple[pd.Data
         filtered = filtered[
             filtered["main_tags"].fillna("").apply(
                 lambda x: bool(set(selected_tags) & {t.strip() for t in str(x).split("|") if t.strip()})
+            )
+        ]
+
+    if selected_source_topics and "source_main_topics" in filtered.columns:
+        selected_source_set = set(selected_source_topics)
+        filtered = filtered[
+            filtered["source_main_topics"].fillna("").apply(
+                lambda x: bool(selected_source_set & {t.strip() for t in str(x).split(";") if t.strip()})
             )
         ]
 
@@ -1374,6 +1436,7 @@ def event_table(events: pd.DataFrame) -> str | None:
     table["Негатив"] = table["negative_share"].apply(format_pct)
     table["Токсичность"] = table["toxic_share"].apply(format_pct)
     table["Теги"] = table["main_tags"].fillna("").astype(str).str.replace("|", ", ", regex=False)
+    table["Тема из файла"] = table.get("source_main_topics", pd.Series([""] * len(table))).fillna("").astype(str).str.replace(";", ",", regex=False)
     table["Название"] = table["event_title"]
     table["Описание"] = table["event_summary"]
     table["Сообщений"] = table["message_count"]
@@ -1385,6 +1448,10 @@ def event_table(events: pd.DataFrame) -> str | None:
     display_cols = [
         "Название",
         "Описание",
+    ]
+    if table["Тема из файла"].fillna("").astype(str).str.strip().any():
+        display_cols.append("Тема из файла")
+    display_cols += [
         "Теги",
         "Период",
         "Сообщений",
@@ -1406,6 +1473,7 @@ def event_table(events: pd.DataFrame) -> str | None:
             "Описание": st.column_config.TextColumn(width="large"),
             "Название": st.column_config.TextColumn(width="medium"),
             "Теги": st.column_config.TextColumn(width="medium"),
+            "Тема из файла": st.column_config.TextColumn(width="medium"),
             "Сообщений": st.column_config.NumberColumn(format="%d"),
             "Чатов": st.column_config.NumberColumn(format="%d"),
             "Важность": st.column_config.NumberColumn(format="%.1f"),
@@ -1704,7 +1772,10 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     c5.metric("Важность", round(float(ev.get("importance_score", 0)), 1))
 
     tags = str(ev.get("main_tags", "")).replace("|", " · ")
+    source_topics_caption = str(ev.get("source_main_topics", "") or "").strip()
 
+    if source_topics_caption:
+        st.caption(f"Тема из файла: {source_topics_caption}")
     st.caption(f"Теги: {tags}")
 
     tab_names = ["Ключевые сообщения", "Вся лента"] + (["Правки"] if can_edit else [])
@@ -2385,7 +2456,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.2: исправлены саммари и метрики при выборе нескольких периодов")
+        st.caption("Версия 3.3: добавлена поддержка готовой разметки тем из файла")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 

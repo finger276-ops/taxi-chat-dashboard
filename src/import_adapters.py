@@ -45,6 +45,10 @@ CANONICAL_COLUMNS = [
     "Категории",
     "Сюжет",
     "Id сообщения",
+    "Основная тема",
+    "Все темы",
+    "Все темы (список)",
+    "Релевантное",
     "source_system",
     "source_file",
 ]
@@ -105,6 +109,9 @@ def _find_csv_header(path: Path) -> tuple[int, str]:
         "тональность",
         "блог",
         "площадка",
+        "основная тема",
+        "все темы",
+        "релевантное",
     ]
     for idx, line in enumerate(lines):
         if not line:
@@ -160,6 +167,9 @@ def _find_excel_header(frame: pd.DataFrame) -> int:
         "где пишет",
         "тональность",
         "id сообщения",
+        "основная тема",
+        "все темы",
+        "релевантное",
     ]
     best_idx = 0
     best_score = -1
@@ -239,6 +249,33 @@ def _normalize_sentiment(series: pd.Series) -> pd.Series:
     return series.apply(convert)
 
 
+
+def _normalize_topics_list(value: object) -> str:
+    """Normalize list-like topic values to semicolon-separated text."""
+    s = "" if value is None else str(value).strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return ""
+    s = s.replace("\ufeff", "").replace("\xa0", " ")
+    # Values may arrive as: ['A', 'B'], A; B, A|B, or multiline.
+    s = s.strip("[]")
+    s = s.replace("'", "").replace('"', "")
+    parts = re.split(r"\s*[;|,\n]\s*", s)
+    seen = []
+    for part in parts:
+        part = re.sub(r"\s+", " ", str(part).strip())
+        if part and part not in seen:
+            seen.append(part)
+    return "; ".join(seen)
+
+
+def _normalize_bool_text(value: object) -> str:
+    s = "" if value is None else str(value).strip().lower().replace("ё", "е")
+    if s in {"true", "1", "да", "yes", "+", "истина", "верно"}:
+        return "True"
+    if s in {"false", "0", "нет", "no", "-", "ложь", "неверно"}:
+        return "False"
+    return str(value).strip() if value is not None else ""
+
 def canonicalize_table(raw: pd.DataFrame, source_file: str = "", source_system: str = "auto") -> pd.DataFrame:
     df = _clean_dataframe(raw)
     detected = detect_source_system(df) if source_system in {"", "auto", None} else str(source_system)
@@ -287,6 +324,21 @@ def canonicalize_table(raw: pd.DataFrame, source_file: str = "", source_system: 
     out["Категории"] = first_existing(df, ["Категории", "Category", "Categories"])
     out["Сюжет"] = first_existing(df, ["Сюжет", "Topic", "Theme", "Тема"])
     out["Id сообщения"] = first_existing(df, ["Id сообщения", "ID сообщения", "message_id", "id", "Hash сообщения"])
+
+    # Optional human/topic markup columns. If present, they become a top-level
+    # boundary for clustering, but do not replace information events.
+    main_topic = first_existing(df, ["Основная тема", "Главная тема", "Main topic", "Primary topic", "Topic main"])
+    all_topics_raw = first_existing(df, ["Все темы", "Темы", "Topics", "All topics"])
+    all_topics_list = first_existing(df, ["Все темы (список)", "Список тем", "Topics list", "All topics list"])
+    relevant = first_existing(df, ["Релевантное", "Релевантность", "Relevant", "Is relevant"])
+
+    out["Основная тема"] = main_topic.apply(lambda x: re.sub(r"\s+", " ", str(x).strip()))
+    out["Все темы"] = all_topics_raw.apply(_normalize_topics_list)
+    out["Все темы (список)"] = all_topics_list.apply(_normalize_topics_list)
+    out.loc[out["Все темы (список)"].str.strip() == "", "Все темы (список)"] = out.loc[
+        out["Все темы (список)"].str.strip() == "", "Все темы"
+    ]
+    out["Релевантное"] = relevant.apply(_normalize_bool_text)
 
     for tag in MEDIALOGIA_DEFAULT_TAGS:
         if tag in df.columns:

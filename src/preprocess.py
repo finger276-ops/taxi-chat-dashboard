@@ -132,6 +132,36 @@ def split_tag_text(value: str) -> list[str]:
     return tags
 
 
+
+def split_source_topics(value: str) -> list[str]:
+    value = normalize_spaces(value)
+    if not value or value.lower() in {"nan", "none", "null", "нет", "n/a"}:
+        return []
+    value = value.strip("[]").replace("'", "").replace('"', "")
+    parts = re.split(r"[|;,\n]+", value)
+    topics = []
+    for part in parts:
+        topic = normalize_spaces(part)
+        if topic and topic not in topics:
+            topics.append(topic)
+    return topics
+
+
+def normalize_relevant(value: object, default: bool = True) -> bool:
+    s = normalize_spaces(value).lower().replace("ё", "е")
+    if not s:
+        return default
+    if s in {"true", "1", "да", "yes", "+", "истина", "верно", "relevant"}:
+        return True
+    if s in {"false", "0", "нет", "no", "-", "ложь", "неверно", "irrelevant", "нерелевант", "нерелевантное"}:
+        return False
+    return default
+
+
+def source_topic_bucket_value(value: str) -> str:
+    topic = normalize_spaces(value)
+    return topic if topic else "без_темы_источника"
+
 def row_tags(row: pd.Series, tag_cols: list[str]) -> list[str]:
     tags = []
     for tag in tag_cols:
@@ -255,6 +285,28 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
 
     raw_tag_lists = df.apply(lambda r: row_tags(r, tag_cols), axis=1)
 
+    source_main_topic_series = get_text_series(
+        df,
+        "Основная тема",
+        aliases=["Главная тема", "Main topic", "Primary topic", "source_main_topic"],
+    ).apply(normalize_spaces)
+    source_topics_series = get_text_series(
+        df,
+        "Все темы (список)",
+        aliases=["Все темы", "Темы", "Topics", "source_topics"],
+    ).apply(lambda x: "; ".join(split_source_topics(x)))
+    # If there is no separate list of topics, keep the main source topic as a one-item list.
+    source_topics_series = source_topics_series.where(source_topics_series.str.strip() != "", source_main_topic_series)
+    relevant_series = get_text_series(
+        df,
+        "Релевантное",
+        aliases=["Релевантность", "Relevant", "Is relevant", "source_relevant"],
+    ).apply(lambda x: normalize_relevant(x, default=True))
+
+    df["source_main_topic"] = source_main_topic_series
+    df["source_topics"] = source_topics_series
+    df["source_relevant"] = relevant_series
+
     # Narrow rule-based topic used before clustering. For very short replies,
     # include a small parent-post context, but do not let parent text dominate.
     parent_context = get_text_series(
@@ -329,6 +381,9 @@ def normalize_messages(raw: pd.DataFrame, tag_cols: list[str]) -> tuple[pd.DataF
         "tags": "tags",
         "tag_count": "tag_count",
         "microtopic": "microtopic",
+        "source_main_topic": "source_main_topic",
+        "source_topics": "source_topics",
+        "source_relevant": "source_relevant",
         "source_system": "source_system",
         "source_file": "source_file",
         "is_negative": "is_negative",
@@ -420,7 +475,8 @@ def classify_microtopic(text: str, tags: str | Iterable[str] = "") -> str:
 def topic_bucket_for(row: pd.Series) -> str:
     tag = main_tag([row.get("main_tags", row.get("tags", ""))])
     microtopic = str(row.get("microtopic", "other") or "other")
-    return f"{tag}::{microtopic}"
+    source_topic = source_topic_bucket_value(row.get("source_main_topic", ""))
+    return f"{source_topic}::{tag}::{microtopic}"
 
 
 def should_start_new_discussion(prev_row: pd.Series, row: pd.Series, window_minutes: int) -> bool:
@@ -429,6 +485,11 @@ def should_start_new_discussion(prev_row: pd.Series, row: pd.Series, window_minu
 
     gap = row["datetime"] - prev_row["datetime"]
     if gap > pd.Timedelta(minutes=window_minutes):
+        return True
+
+    prev_source_topic = normalize_spaces(prev_row.get("source_main_topic", ""))
+    curr_source_topic = normalize_spaces(row.get("source_main_topic", ""))
+    if prev_source_topic and curr_source_topic and prev_source_topic != curr_source_topic:
         return True
 
     prev_micro = str(prev_row.get("microtopic", "other") or "other")
@@ -500,6 +561,18 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
         else:
             discussion_text = normalize_spaces((messages_block + "\n" + parent_block[:180]).strip())
 
+        source_main_topic_counts = Counter(
+            normalize_spaces(x)
+            for x in group.get("source_main_topic", pd.Series(dtype=str)).fillna("").astype(str)
+            if normalize_spaces(x)
+        )
+        source_main_topic = source_main_topic_counts.most_common(1)[0][0] if source_main_topic_counts else ""
+        source_topic_values = []
+        for value in group.get("source_topics", pd.Series(dtype=str)).fillna("").astype(str):
+            for topic in split_source_topics(value):
+                if topic not in source_topic_values:
+                    source_topic_values.append(topic)
+
         microtopic_counts = Counter(group.get("microtopic", pd.Series(["other"])).fillna("other").astype(str))
         microtopic = microtopic_counts.most_common(1)[0][0] if microtopic_counts else "other"
 
@@ -519,7 +592,9 @@ def make_discussions(messages: pd.DataFrame, window_minutes: int = 60) -> tuple[
             "parent_link": group["parent_link"].iloc[0] if "parent_link" in group else "",
             "main_tags": "|".join(tags),
             "microtopic": microtopic,
-            "topic_bucket": main_tag(["|".join(tags)]) + "::" + microtopic,
+            "source_main_topic": source_main_topic,
+            "source_topics": "; ".join(source_topic_values),
+            "topic_bucket": source_topic_bucket_value(source_main_topic) + "::" + main_tag(["|".join(tags)]) + "::" + microtopic,
             "message_count": int(group["message_id"].nunique()),
             "author_count": int(group["author_id"].nunique()) if "author_id" in group else 0,
             "negative_count": int(group["is_negative"].astype(bool).sum()) if "is_negative" in group else 0,
@@ -850,7 +925,8 @@ def refine_labels_by_tag(labels: pd.Series, discussions: pd.DataFrame) -> pd.Ser
     for i, row in discussions.iterrows():
         raw_label = int(labels.loc[i])
         mt = main_tag([row.get("main_tags", "")])
-        key = (raw_label, mt)
+        source_topic = source_topic_bucket_value(row.get("source_main_topic", ""))
+        key = (raw_label, source_topic, mt)
         if key not in label_map:
             label_map[key] = next_id
             next_id += 1
@@ -917,6 +993,18 @@ def make_events(
         microtopic_counter = Counter(group.get("microtopic", pd.Series(["other"])).fillna("other").astype(str))
         microtopic = microtopic_counter.most_common(1)[0][0] if microtopic_counter else "other"
 
+        source_main_topic_counter = Counter(
+            normalize_spaces(x)
+            for x in group.get("source_main_topic", pd.Series(dtype=str)).fillna("").astype(str)
+            if normalize_spaces(x)
+        )
+        source_main_topic = source_main_topic_counter.most_common(1)[0][0] if source_main_topic_counter else ""
+        source_topic_values = []
+        for value in group.get("source_topics", pd.Series(dtype=str)).fillna("").astype(str):
+            for topic in split_source_topics(value):
+                if topic not in source_topic_values:
+                    source_topic_values.append(topic)
+
         start = pd.to_datetime(group["start_date"], errors="coerce").min()
         end = pd.to_datetime(group["end_date"], errors="coerce").max()
         msg_count = int(group["message_count"].sum())
@@ -947,6 +1035,8 @@ def make_events(
             "main_tag": tag,
             "microtopic": microtopic,
             "main_tags": "|".join(all_tags),
+            "source_main_topic": source_main_topic,
+            "source_topics": "; ".join(source_topic_values),
             "keywords": "|".join(keywords),
             "key_phrases": "|".join(phrases),
             "start_date": start,
