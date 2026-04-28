@@ -566,9 +566,12 @@ def parse_date_value(value):
     """Parse a date value safely and prefer Russian DD.MM.YYYY for user input."""
     if value is None:
         return None
-    if isinstance(value, pd.Timestamp):
+    try:
         if pd.isna(value):
             return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
         return value.date()
     if isinstance(value, datetime):
         return value.date()
@@ -576,7 +579,7 @@ def parse_date_value(value):
         return value
 
     text = str(value or "").strip()
-    if not text or text.lower() in {"nat", "nan", "none"}:
+    if not text or text.lower() in {"nat", "nan", "none", "null", "<na>"}:
         return None
 
     iso_match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", text)
@@ -601,7 +604,6 @@ def parse_date_value(value):
         return None
     return dt.date()
 
-
 def date_to_iso(value) -> str | None:
     parsed = parse_date_value(value)
     return parsed.isoformat() if parsed else None
@@ -610,8 +612,17 @@ def date_to_iso(value) -> str | None:
 def format_date(value) -> str:
     """Return a user-facing date without time: DD.MM.YYYY."""
     parsed = parse_date_value(value)
-    return parsed.strftime("%d.%m.%Y") if parsed else ""
-
+    if parsed is None:
+        return ""
+    try:
+        if pd.isna(parsed):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    try:
+        return parsed.strftime("%d.%m.%Y")
+    except Exception:
+        return ""
 
 def format_date_series(series: pd.Series) -> pd.Series:
     """Format pandas datetime/string series as DD.MM.YYYY strings for display tables."""
@@ -629,17 +640,14 @@ def parse_user_date(value: str):
 
 
 def format_period(row: pd.Series) -> str:
-    start = pd.to_datetime(row.get("start_date"), errors="coerce")
-    end = pd.to_datetime(row.get("end_date"), errors="coerce")
-    start_s = format_date(start)
-    end_s = format_date(end)
+    start_s = format_date(row.get("start_date"))
+    end_s = format_date(row.get("end_date"))
 
     if not start_s:
         return end_s
     if not end_s or start_s == end_s:
         return start_s
     return f"{start_s} — {end_s}"
-
 
 def get_selected_rows(event) -> list[int]:
     try:
@@ -1738,7 +1746,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.4: исправлено редактирование дат периодов в формате ДД.ММ.ГГГГ")
+    st.caption("Версия 2.5: исправлено безопасное отображение пустых дат в периодах")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
