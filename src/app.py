@@ -1501,22 +1501,64 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                             st.rerun()
 
             st.markdown("#### Объединить с другим инфоповодом")
-            st.caption("Объединение переносит всю видимую тему целиком: все исходные события/волны обсуждения, которые скрыты под выбранной строкой.")
-            candidates = events[events["event_id"] != event_id][["event_id", "event_title", "message_count"]].copy()
-            candidates["label"] = candidates.apply(
-                lambda r: f"{str(r['event_title'])[:120]} · {int(r.get('message_count', 0))} сообщ.",
-                axis=1,
+            st.caption(
+                "Объединение переносит всю видимую тему целиком: все исходные события/волны обсуждения, "
+                "которые скрыты под выбранной строкой."
             )
-            target_label = st.selectbox("Целевой инфоповод", candidates["label"].tolist() if len(candidates) else [])
-            reason = st.text_input("Причина объединения", value="")
-            if st.button("Объединить", disabled=not bool(target_label)):
-                target_id = candidates.loc[candidates["label"] == target_label, "event_id"].iloc[0]
+
+            current_source_ids_raw = str(ev.get("source_event_ids", "") or "")
+            current_source_ids = {x.strip() for x in current_source_ids_raw.split("|") if x.strip()}
+            current_source_ids.add(str(event_id))
+
+            merge_candidates = events[~events["event_id"].astype(str).isin(current_source_ids)].copy()
+            merge_candidates = merge_candidates[["event_id", "event_title", "message_count", "start_date", "end_date"]].copy()
+            merge_candidates["event_id"] = merge_candidates["event_id"].astype(str)
+            merge_candidates["search_text"] = merge_candidates["event_title"].fillna("").astype(str).str.lower()
+
+            target_search = st.text_input(
+                "Поиск целевого инфоповода",
+                value="",
+                placeholder="Начните вводить название темы, если список большой",
+                key=f"merge_target_search_{event_id}",
+            )
+            if target_search.strip():
+                q = target_search.strip().lower().replace("ё", "е")
+                title_norm = merge_candidates["search_text"].str.replace("ё", "е", regex=False)
+                merge_candidates = merge_candidates[title_norm.str.contains(q, regex=False, na=False)]
+
+            merge_candidates = merge_candidates.sort_values(["message_count", "event_title"], ascending=[False, True])
+
+            target_label_map = {}
+            for _, candidate_row in merge_candidates.iterrows():
+                candidate_id = str(candidate_row.get("event_id", ""))
+                title_part = str(candidate_row.get("event_title", "") or "Без названия")[:120]
+                msg_count = int(candidate_row.get("message_count", 0) or 0)
+                period_part = format_period(candidate_row)
+                suffix = f" · {msg_count} сообщ."
+                if period_part:
+                    suffix += f" · {period_part}"
+                target_label_map[candidate_id] = f"{title_part}{suffix}"
+
+            target_options = [""] + list(target_label_map.keys())
+            selected_target_id = st.selectbox(
+                "Целевой инфоповод",
+                options=target_options,
+                format_func=lambda x: target_label_map.get(str(x), "— выберите инфоповод —"),
+                key=f"merge_target_id_{event_id}",
+            )
+            if selected_target_id:
+                st.caption(f"Выбран целевой инфоповод: {target_label_map.get(str(selected_target_id), selected_target_id)}")
+            elif len(merge_candidates) == 0:
+                st.info("Подходящих инфоповодов для объединения не найдено. Попробуйте изменить поиск.")
+
+            reason = st.text_input("Причина объединения", value="", key=f"merge_reason_{event_id}")
+            if st.button("Объединить", disabled=not bool(selected_target_id), key=f"merge_button_{event_id}"):
+                target_id = str(selected_target_id)
                 try:
-                    source_ids_raw = str(ev.get("source_event_ids", "") or "")
-                    source_ids = [x.strip() for x in source_ids_raw.split("|") if x.strip()] or [str(event_id)]
+                    source_ids = sorted(current_source_ids)
                     merged_count = 0
                     for source_id in source_ids:
-                        if source_id == str(target_id):
+                        if source_id == target_id:
                             continue
                         merge_events(conn, source_event_id=source_id, target_event_id=target_id, reason=reason)
                         merged_count += 1
@@ -1935,7 +1977,7 @@ def main():
     )
 
     st.title("Дайджест водительских чатов")
-    st.caption("Версия 2.6: добавлено редактируемое саммари периода перед инфоповодами")
+    st.caption("Версия 2.7: исправлен выбор целевого инфоповода при объединении")
 
     data_dir = Path(args.data_dir)
     db_path = Path(args.db_path)
