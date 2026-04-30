@@ -215,17 +215,24 @@ def list_periods(include_inactive: bool = False) -> pd.DataFrame:
 
 
 def load_table_from_supabase(period_ids: list[str], table_name: str) -> pd.DataFrame:
+    """Load one generated table for all selected periods in batched requests."""
+    period_ids = [str(x) for x in (period_ids or []) if str(x).strip()]
+    if not period_ids:
+        return pd.DataFrame()
+
     client = get_supabase_client()
-    all_payloads: list[dict[str, Any]] = []
-    for period_id in period_ids:
-        rows = _fetch_all(client, "dashboard_table_rows", filters={"period_id": period_id, "table_name": table_name})
-        for row in rows:
-            payload = row.get("payload") or {}
-            if isinstance(payload, dict):
-                payload.setdefault("period_id", period_id)
-                all_payloads.append(payload)
-    df = pd.DataFrame(all_payloads)
-    return df
+    rows = _fetch_all(
+        client,
+        "dashboard_table_rows",
+        filters={"period_id": period_ids, "table_name": table_name},
+    )
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload") or {}
+        if isinstance(payload, dict):
+            payload.setdefault("period_id", row.get("period_id"))
+            payloads.append(payload)
+    return pd.DataFrame(payloads)
 
 
 def _prefix_generated_ids(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:

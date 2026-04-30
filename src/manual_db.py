@@ -54,6 +54,46 @@ def _payload_df(conn: SupabaseManualStore, table_name: str) -> pd.DataFrame:
     return pd.DataFrame(payloads)
 
 
+def load_all_manual_tables(conn) -> dict[str, pd.DataFrame]:
+    """Load all manual/moderation tables in one pass.
+
+    In Supabase mode the previous app code called 6+ getters, and each getter
+    made a separate request to dashboard_manual_rows. This helper fetches that
+    table once and splits payloads locally. SQLite mode reads the same tables
+    from the local DB.
+    """
+    table_names = [
+        "event_overrides",
+        "event_merges",
+        "message_overrides",
+        "event_message_exclusions",
+        "event_key_messages",
+        "message_topic_overrides",
+        "manual_events",
+        "period_summaries",
+        "audit_log",
+    ]
+
+    if is_supabase_conn(conn):
+        rows = _fetch_all(conn.client, "dashboard_manual_rows")
+        grouped: dict[str, list[dict]] = {name: [] for name in table_names}
+        for row in rows:
+            table_name = str(row.get("table_name", "") or "")
+            payload = row.get("payload") or {}
+            if table_name in grouped and isinstance(payload, dict):
+                grouped[table_name].append(payload)
+        return {name: pd.DataFrame(grouped.get(name, [])) for name in table_names}
+
+    init_db(conn)
+    result: dict[str, pd.DataFrame] = {}
+    for name in table_names:
+        try:
+            result[name] = pd.read_sql_query(f"SELECT * FROM {name}", conn)
+        except Exception:
+            result[name] = pd.DataFrame()
+    return result
+
+
 def _get_payload(conn: SupabaseManualStore, table_name: str, row_key: str) -> dict:
     response = conn.client.table("dashboard_manual_rows").select("payload").eq("row_key", row_key).limit(1).execute()
     data = response.data or []
