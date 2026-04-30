@@ -1231,20 +1231,27 @@ def normalize_search_query(value: str) -> str:
 def filter_messages_by_word(messages: pd.DataFrame, query: str) -> pd.DataFrame:
     """Return visible messages whose text contains the entered word or phrase."""
     q = normalize_search_query(query)
-    if not q or "text_clean" not in messages.columns:
-        return messages.iloc[0:0].copy()
+    if not q or not isinstance(messages, pd.DataFrame) or messages.empty:
+        return messages.iloc[0:0].copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
 
-    work = messages.copy()
-    if "message_hidden" in work.columns:
+    work = messages
+    if "_message_hidden_bool" in work.columns:
+        work = work[~work["_message_hidden_bool"].astype(bool)]
+    elif "message_hidden" in work.columns:
         work = work[~work["message_hidden"].astype(bool)]
 
-    text = (
-        work["text_clean"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-        .str.replace("ё", "е", regex=False)
-    )
+    if "_search_text" in work.columns:
+        text = work["_search_text"].fillna("").astype(str)
+    elif "text_clean" in work.columns:
+        text = (
+            work["text_clean"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .str.replace("ё", "е", regex=False)
+        )
+    else:
+        return work.iloc[0:0].copy()
     return work[text.str.contains(q, regex=False, na=False)].copy()
 
 
@@ -1377,22 +1384,68 @@ def show_manual_event_creator(conn):
             st.rerun()
 
 
+def prepare_messages_for_ui(messages: pd.DataFrame) -> pd.DataFrame:
+    """Add reusable helper columns so filters/cards do not rebuild strings every rerun.
+
+    The dashboard repeatedly checks hidden flags, final event ids and text search.
+    Doing those conversions once per prepared frame is noticeably cheaper than
+    lowercasing/casting large message tables inside every widget.
+    """
+    if not isinstance(messages, pd.DataFrame) or messages.empty:
+        return messages
+
+    work = messages.copy()
+    if "_message_hidden_bool" not in work.columns:
+        if "message_hidden" in work.columns:
+            work["_message_hidden_bool"] = work["message_hidden"].astype(bool)
+        else:
+            work["_message_hidden_bool"] = False
+
+    if "final_event_id" in work.columns and "_final_event_id_str" not in work.columns:
+        work["_final_event_id_str"] = work["final_event_id"].fillna("").astype(str)
+
+    if "source_final_event_id" in work.columns and "_source_final_event_id_str" not in work.columns:
+        work["_source_final_event_id_str"] = work["source_final_event_id"].fillna("").astype(str)
+
+    if "text_clean" in work.columns and "_search_text" not in work.columns:
+        work["_search_text"] = (
+            work["text_clean"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .str.replace("ё", "е", regex=False)
+        )
+    return work
+
+
 def messages_for_events(messages: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     """Return visible messages that belong to the currently displayed events."""
     if not isinstance(messages, pd.DataFrame) or messages.empty or not isinstance(events, pd.DataFrame) or events.empty:
         return pd.DataFrame()
-    if "event_id" not in events.columns or "final_event_id" not in messages.columns:
+    if "event_id" not in events.columns:
         return pd.DataFrame()
+
     event_ids = set(events["event_id"].dropna().astype(str))
-    result = messages[messages["final_event_id"].astype(str).isin(event_ids)].copy()
-    if "message_hidden" in result.columns:
-        result = result[~result["message_hidden"].astype(bool)]
-    return result
+    if "_final_event_id_str" in messages.columns:
+        mask = messages["_final_event_id_str"].isin(event_ids)
+    elif "final_event_id" in messages.columns:
+        mask = messages["final_event_id"].astype(str).isin(event_ids)
+    else:
+        return pd.DataFrame()
+
+    if "_message_hidden_bool" in messages.columns:
+        mask = mask & (~messages["_message_hidden_bool"].astype(bool))
+    elif "message_hidden" in messages.columns:
+        mask = mask & (~messages["message_hidden"].astype(bool))
+
+    return messages.loc[mask].copy()
 
 
 def show_kpis(events: pd.DataFrame, messages: pd.DataFrame | None = None):
     visible_messages = messages.copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
-    if "message_hidden" in visible_messages.columns:
+    if "_message_hidden_bool" in visible_messages.columns:
+        visible_messages = visible_messages[~visible_messages["_message_hidden_bool"].astype(bool)]
+    elif "message_hidden" in visible_messages.columns:
         visible_messages = visible_messages[~visible_messages["message_hidden"].astype(bool)]
 
     if not visible_messages.empty:
@@ -1856,6 +1909,7 @@ def build_digest_export_payload(
     *,
     max_topics: int = 8,
     quotes_per_topic: int = 3,
+    pinned_messages: pd.DataFrame | None = None,
 ) -> dict:
     """Build a plain data payload for DOCX/PDF digest export."""
     visible_messages = _visible_messages_for_digest(messages)
@@ -1864,7 +1918,7 @@ def build_digest_export_payload(
     sentiment = _sentiment_counts(visible_messages)
     total_messages = int(sentiment["total"])
 
-    pinned_df = get_key_message_pins(conn)
+    pinned_df = pinned_messages if isinstance(pinned_messages, pd.DataFrame) else get_key_message_pins(conn)
     if isinstance(pinned_df, pd.DataFrame) and not pinned_df.empty:
         pinned_df = pinned_df.copy()
         pinned_df["event_id"] = pinned_df.get("event_id", "").astype(str)
@@ -2193,7 +2247,7 @@ def _digest_cache_key(events: pd.DataFrame, messages: pd.DataFrame, period_ids: 
     return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
-def render_digest_export(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str], conn) -> None:
+def render_digest_export(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str], conn, manual_tables: dict[str, pd.DataFrame] | None = None) -> None:
     """Render export controls for the current period selection.
 
     The previous version built the payload and generated both DOCX and PDF on
@@ -2242,6 +2296,7 @@ def render_digest_export(events: pd.DataFrame, messages: pd.DataFrame, period_id
         if prepare_docx or prepare_pdf:
             try:
                 with st.spinner("Готовлю данные дайджеста…"):
+                    pinned_df = (manual_tables or {}).get("event_key_messages", pd.DataFrame())
                     payload = build_digest_export_payload(
                         events,
                         messages,
@@ -2249,6 +2304,7 @@ def render_digest_export(events: pd.DataFrame, messages: pd.DataFrame, period_id
                         conn,
                         max_topics=max_topics,
                         quotes_per_topic=quotes_per_topic,
+                        pinned_messages=pinned_df,
                     )
                 if not payload.get("message_count"):
                     st.info("Нет сообщений для выгрузки по выбранному периоду.")
@@ -2836,7 +2892,8 @@ def message_preview_cards(
                     st.rerun()
 
 
-def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame, conn, can_edit: bool = True):
+def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame, conn, can_edit: bool = True, manual_tables: dict[str, pd.DataFrame] | None = None):
+    manual_tables = manual_tables or {}
     selected = events[events["event_id"] == event_id]
     if selected.empty:
         st.warning("Инфоповод не найден.")
@@ -2861,11 +2918,31 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 return sorted(ids)[0]
         return str(visible_id)
 
-    event_messages = messages[
-        (messages["final_event_id"] == event_id)
-        & (~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool))
-    ].copy()
-    event_messages = event_messages.sort_values("datetime")
+    event_messages_cache: pd.DataFrame | None = None
+
+    def get_event_messages() -> pd.DataFrame:
+        """Build the selected event message slice only when a section needs it."""
+        nonlocal event_messages_cache
+        if event_messages_cache is not None:
+            return event_messages_cache
+        if not isinstance(messages, pd.DataFrame) or messages.empty:
+            event_messages_cache = pd.DataFrame()
+            return event_messages_cache
+        if "_final_event_id_str" in messages.columns:
+            mask = messages["_final_event_id_str"].eq(str(event_id))
+        elif "final_event_id" in messages.columns:
+            mask = messages["final_event_id"].astype(str).eq(str(event_id))
+        else:
+            event_messages_cache = pd.DataFrame()
+            return event_messages_cache
+        if "_message_hidden_bool" in messages.columns:
+            mask = mask & (~messages["_message_hidden_bool"].astype(bool))
+        elif "message_hidden" in messages.columns:
+            mask = mask & (~messages["message_hidden"].astype(bool))
+        event_messages_cache = messages.loc[mask].copy()
+        if "datetime" in event_messages_cache.columns:
+            event_messages_cache = event_messages_cache.sort_values("datetime")
+        return event_messages_cache
 
     pinned_message_ids: set[str] = set()
 
@@ -2902,14 +2979,15 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     )
 
     if card_section in {"Ключевые сообщения", "Вся лента"}:
-        pinned_messages = get_key_message_pins(conn)
-        if pinned_messages is not None and not pinned_messages.empty:
+        pinned_messages = manual_tables.get("event_key_messages", pd.DataFrame())
+        if pinned_messages is not None and isinstance(pinned_messages, pd.DataFrame) and not pinned_messages.empty:
             pinned_messages = pinned_messages.copy()
             pinned_messages["event_id"] = pinned_messages.get("event_id", "").astype(str)
             pinned_messages["message_id"] = pinned_messages.get("message_id", "").astype(str)
             pinned_message_ids = set(pinned_messages.loc[pinned_messages["event_id"] == str(event_id), "message_id"].tolist())
 
     if card_section == "Ключевые сообщения":
+        event_messages = get_event_messages()
         message_preview_cards(
             event_messages,
             limit=10,
@@ -2923,6 +3001,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         )
 
     if card_section == "Вся лента":
+        event_messages = get_event_messages()
         if event_messages.empty:
             st.info("Сообщения не найдены.")
         else:
@@ -3299,7 +3378,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.rerun()
 
         st.markdown("#### Нерелевантные сообщения")
-        exclusions = get_message_exclusions(conn)
+        exclusions = manual_tables.get("event_message_exclusions", pd.DataFrame())
         if not exclusions.empty:
             exclusion_source_ids = {str(x) for x in event_source_ids} | {str(event_id)}
             event_exclusions = exclusions[exclusions["event_id"].astype(str).isin(exclusion_source_ids)]
@@ -3498,10 +3577,17 @@ def show_message_search(messages: pd.DataFrame, events: pd.DataFrame, conn):
     tag = col2.text_input("Тег")
     chat = col3.text_input("Чат")
 
-    filtered = messages[~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool)].copy()
+    if "_message_hidden_bool" in messages.columns:
+        filtered = messages[~messages["_message_hidden_bool"].astype(bool)].copy()
+    else:
+        filtered = messages[~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool)].copy()
 
     if q:
-        filtered = filtered[filtered["text_clean"].fillna("").str.lower().str.contains(q.lower(), regex=False)]
+        q_norm = q.lower().replace("ё", "е")
+        if "_search_text" in filtered.columns:
+            filtered = filtered[filtered["_search_text"].fillna("").astype(str).str.contains(q_norm, regex=False, na=False)]
+        else:
+            filtered = filtered[filtered["text_clean"].fillna("").astype(str).str.lower().str.replace("ё", "е", regex=False).str.contains(q_norm, regex=False, na=False)]
     if tag and "tags" in filtered.columns:
         filtered = filtered[filtered["tags"].fillna("").str.lower().str.contains(tag.lower(), regex=False)]
     if chat and "chat_title" in filtered.columns:
@@ -3596,6 +3682,16 @@ def cached_apply_manual_edits(
         manual_events,
         msg_topic_overrides,
     )
+
+
+@st.cache_data(show_spinner=False)
+def cached_build_consolidated_events(
+    events: pd.DataFrame,
+    messages: pd.DataFrame,
+    level: str,
+    overrides: pd.DataFrame,
+):
+    return build_consolidated_events(events, messages, level=level, overrides=overrides)
 
 
 def render_period_selector() -> list[str]:
@@ -3950,7 +4046,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.9: ускорена загрузка, лента и выгрузка дайджеста")
+        st.caption("Версия 4.0: второй этап ускорения — быстрые таблицы и ленивые карточки")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
@@ -4001,12 +4097,13 @@ def main():
 
     events_before_consolidation = events.copy()
     consolidation_level = render_consolidation_level_control(can_edit)
-    events, enriched_messages = build_consolidated_events(
+    events, enriched_messages = cached_build_consolidated_events(
         events,
         enriched_messages,
-        level=consolidation_level,
-        overrides=overrides,
+        consolidation_level,
+        overrides,
     )
+    enriched_messages = prepare_messages_for_ui(enriched_messages)
     render_consolidation_quality(
         events_before_consolidation,
         events,
@@ -4028,7 +4125,7 @@ def main():
         render_period_comparison(enriched_messages, selected_period_ids)
 
     render_dashboard_summary(events, enriched_messages, selected_period_ids, conn, can_edit)
-    render_digest_export(events, enriched_messages, selected_period_ids, conn)
+    render_digest_export(events, enriched_messages, selected_period_ids, conn, manual_tables=manual_tables)
 
     filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
     filtered_messages = messages_for_events(enriched_messages, filtered_events)
@@ -4037,7 +4134,7 @@ def main():
         word_message_results_table(word_matches, events, word_query)
     selected_event_id = event_table(filtered_events)
     if selected_event_id:
-        show_event_card(selected_event_id, events, enriched_messages, conn, can_edit=can_edit)
+        show_event_card(selected_event_id, events, enriched_messages, conn, can_edit=can_edit, manual_tables=manual_tables)
 
 
 if __name__ == "__main__":

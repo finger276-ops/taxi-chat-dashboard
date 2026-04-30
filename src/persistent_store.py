@@ -166,12 +166,12 @@ def chunked(items: list[Any], size: int = CHUNK_SIZE) -> Iterable[list[Any]]:
         yield items[i:i + size]
 
 
-def _fetch_all(client: Client, table: str, *, filters: dict[str, Any] | None = None, order: str | None = None) -> list[dict[str, Any]]:
+def _fetch_all(client: Client, table: str, *, filters: dict[str, Any] | None = None, order: str | None = None, select: str = "*") -> list[dict[str, Any]]:
     """Paginated select. Supabase defaults to 1000 rows per request."""
     rows: list[dict[str, Any]] = []
     start = 0
     while True:
-        query = client.table(table).select("*")
+        query = client.table(table).select(select)
         if filters:
             for key, value in filters.items():
                 if isinstance(value, (list, tuple, set)):
@@ -225,6 +225,7 @@ def load_table_from_supabase(period_ids: list[str], table_name: str) -> pd.DataF
         client,
         "dashboard_table_rows",
         filters={"period_id": period_ids, "table_name": table_name},
+        select="period_id,payload",
     )
     payloads: list[dict[str, Any]] = []
     for row in rows:
@@ -236,13 +237,20 @@ def load_table_from_supabase(period_ids: list[str], table_name: str) -> pd.DataF
 
 
 def _prefix_generated_ids(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Prefix generated event/discussion IDs by period to avoid collisions across periods."""
+    """Prefix generated event/discussion IDs by period to avoid collisions across periods.
+
+    This used to call DataFrame.apply(row-wise), which becomes slow on larger
+    multi-period loads. Vectorized string operations keep Supabase loading fast.
+    """
     if df is None or df.empty or "period_id" not in df.columns:
         return df
     df = df.copy()
+    period_prefix = df["period_id"].fillna("").astype(str) + "__"
     for col in columns:
         if col in df.columns:
-            df[col] = df.apply(lambda r: f"{r['period_id']}__{r[col]}" if pd.notna(r[col]) and str(r[col]).strip() else r[col], axis=1)
+            value = df[col].fillna("").astype(str)
+            mask = value.str.strip().ne("")
+            df.loc[mask, col] = period_prefix[mask] + value[mask]
     return df
 
 

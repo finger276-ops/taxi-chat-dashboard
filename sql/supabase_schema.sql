@@ -36,3 +36,14 @@ create index if not exists idx_dashboard_manual_rows_table
 
 -- Optional: create a private Storage bucket named dashboard-csv in the Supabase UI.
 -- The app can work without Storage because processed rows are stored in Postgres.
+
+-- Extra indexes for faster multi-period dashboard loads.
+-- These are safe to run on an existing Supabase project.
+create index if not exists idx_dashboard_table_rows_table_period
+    on public.dashboard_table_rows(table_name, period_id);
+
+create index if not exists idx_dashboard_periods_status_uploaded
+    on public.dashboard_periods(status, uploaded_at desc);
+
+create index if not exists idx_dashboard_manual_rows_table_updated
+    on public.dashboard_manual_rows(table_name, updated_at desc);
