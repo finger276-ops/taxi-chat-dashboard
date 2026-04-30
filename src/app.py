@@ -2872,7 +2872,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 height=460,
                 hide_index=True,
                 on_select="rerun",
-                selection_mode="single-row",
+                selection_mode="multi-row",
                 column_config={
                     "Дата": st.column_config.TextColumn("Дата", width="small"),
                     "Текст": st.column_config.TextColumn("Текст", width="large"),
@@ -2883,10 +2883,125 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
             )
 
             rows = get_selected_rows(msg_select)
+            selected_message_rows = table.iloc[rows].copy() if rows else table.iloc[0:0].copy()
+
+            if rows and can_edit:
+                st.markdown(f"#### Массовые действия с сообщениями · выбрано: {len(selected_message_rows)}")
+                st.caption(
+                    "Можно выбрать несколько строк в ленте и одним действием пометить их нерелевантными, "
+                    "перенести в другой инфоповод или удалить из выдачи."
+                )
+                with st.expander("Применить действие к выбранным сообщениям", expanded=len(selected_message_rows) > 1):
+                    bulk_note = st.text_input(
+                        "Комментарий к массовому действию",
+                        value="",
+                        key=f"bulk_msg_note_{event_id}",
+                    )
+                    bulk_action = st.radio(
+                        "Действие",
+                        options=[
+                            "Пометить как нерелевантные для текущего инфоповода",
+                            "Перенести в другой инфоповод",
+                            "Удалить из ленты / скрыть везде",
+                        ],
+                        key=f"bulk_msg_action_{event_id}",
+                    )
+
+                    bulk_target_primary_id = ""
+                    if bulk_action == "Перенести в другой инфоповод":
+                        bulk_target_options = events[["event_id", "event_title", "message_count", "start_date", "end_date"]].copy()
+                        bulk_target_options["event_id"] = bulk_target_options["event_id"].astype(str)
+                        bulk_target_options = bulk_target_options.sort_values(["message_count", "event_title"], ascending=[False, True])
+                        bulk_event_search = st.text_input(
+                            "Поиск целевого инфоповода",
+                            value="",
+                            placeholder="Начните вводить название темы",
+                            key=f"bulk_event_search_{event_id}",
+                        )
+                        if bulk_event_search.strip():
+                            q = bulk_event_search.strip().lower().replace("ё", "е")
+                            bulk_target_options = bulk_target_options[
+                                bulk_target_options["event_title"].fillna("").astype(str).str.lower().str.replace("ё", "е", regex=False).str.contains(q, regex=False, na=False)
+                            ]
+
+                        bulk_target_label_map = {}
+                        for _, target_row in bulk_target_options.iterrows():
+                            target_id = str(target_row.get("event_id", ""))
+                            title_part = str(target_row.get("event_title", "") or "Без названия")[:120]
+                            msg_count = int(target_row.get("message_count", 0) or 0)
+                            period_part = format_period(target_row)
+                            suffix = f" · {msg_count} сообщ."
+                            if period_part:
+                                suffix += f" · {period_part}"
+                            bulk_target_label_map[target_id] = f"{title_part}{suffix}"
+
+                        bulk_target_ids = list(bulk_target_label_map.keys())
+                        current_bulk_target_idx = 0
+                        if str(event_id) in bulk_target_ids:
+                            current_bulk_target_idx = bulk_target_ids.index(str(event_id))
+                        bulk_selected_target_id = st.selectbox(
+                            "Куда перенести выбранные сообщения",
+                            options=bulk_target_ids,
+                            index=current_bulk_target_idx if bulk_target_ids else None,
+                            format_func=lambda x: bulk_target_label_map.get(str(x), str(x)),
+                            key=f"bulk_target_event_id_{event_id}",
+                            disabled=not bool(bulk_target_ids),
+                        )
+                        bulk_target_primary_id = primary_id_for_visible_event(str(bulk_selected_target_id)) if bulk_selected_target_id else ""
+
+                    selected_preview = selected_message_rows.copy()
+                    selected_preview["Дата"] = format_date_series(selected_preview.get("datetime", pd.Series(dtype=str)))
+                    selected_preview["Чат"] = selected_preview.get("chat_title", "")
+                    selected_preview["Автор"] = selected_preview.get("author", "")
+                    selected_preview["Текст"] = selected_preview.get("text_clean", "").fillna("").astype(str).str.slice(0, 240)
+                    st.dataframe(
+                        selected_preview[[c for c in ["Дата", "Чат", "Автор", "Текст"] if c in selected_preview.columns]],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(260, 80 + 38 * max(1, len(selected_preview))),
+                        column_config={"Текст": st.column_config.TextColumn(width="large")},
+                    )
+
+                    apply_disabled = selected_message_rows.empty or (bulk_action == "Перенести в другой инфоповод" and not bulk_target_primary_id)
+                    if st.button("Применить к выбранным сообщениям", type="primary", disabled=apply_disabled, key=f"apply_bulk_messages_{event_id}"):
+                        try:
+                            changed_count = 0
+                            skipped_count = 0
+                            selected_unique = selected_message_rows.drop_duplicates(subset=["message_id"]).copy() if "message_id" in selected_message_rows.columns else selected_message_rows.copy()
+                            for _, selected_row in selected_unique.iterrows():
+                                selected_message_id = str(selected_row.get("message_id", "")).strip()
+                                if not selected_message_id:
+                                    skipped_count += 1
+                                    continue
+                                current_source_event_id = str(selected_row.get("source_final_event_id", "") or event_id).strip()
+                                if bulk_action == "Пометить как нерелевантные для текущего инфоповода":
+                                    mark_message_irrelevant(conn, current_source_event_id, selected_message_id, reason=bulk_note)
+                                    changed_count += 1
+                                elif bulk_action == "Перенести в другой инфоповод":
+                                    if not bulk_target_primary_id or str(bulk_target_primary_id) == current_source_event_id:
+                                        skipped_count += 1
+                                        continue
+                                    move_message(conn, selected_message_id, str(bulk_target_primary_id), note=bulk_note)
+                                    changed_count += 1
+                                else:
+                                    hide_message(conn, selected_message_id, hidden=True, note=bulk_note)
+                                    changed_count += 1
+
+                            if changed_count:
+                                st.success(f"Массовое действие выполнено. Обработано сообщений: {changed_count}.")
+                            if skipped_count:
+                                st.info(f"Пропущено сообщений: {skipped_count}.")
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
             if rows:
                 row = table.iloc[rows[0]]
                 message_id = str(row.get("message_id", "")).strip()
                 st.markdown("#### Выбранное сообщение")
+                if len(rows) > 1:
+                    st.caption("Ниже показана точечная карточка первого выбранного сообщения. Массовые действия выше применяются ко всем выбранным строкам.")
                 st.caption(
                     f"{format_date(row.get('datetime'))} · {row.get('chat_title', '')} · "
                     f"{row.get('author', '')} · текущая тема: {message_topic_display(row, str(ev.get('event_title', '')))}"
@@ -2894,7 +3009,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                 st.write(row.get("text_clean", ""))
 
                 if can_edit:
-                    with st.expander("Назначить тему или инфоповод", expanded=True):
+                    with st.expander("Назначить тему или инфоповод", expanded=(len(rows) == 1)):
                         msg_note = st.text_input(
                             "Комментарий к действию",
                             value="",
