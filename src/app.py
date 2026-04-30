@@ -1526,6 +1526,46 @@ def _add_docx_bold_label(paragraph, label: str, text: str = ""):
         paragraph.add_run(text)
 
 
+def _add_docx_hyperlink(paragraph, url: str, text: str = "открыть сообщение"):
+    """Add a clickable external hyperlink to a python-docx paragraph."""
+    url = str(url or "").strip()
+    if not url:
+        return
+    try:
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+        r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("r:id"), r_id)
+
+        new_run = OxmlElement("w:r")
+        r_pr = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), "0563C1")
+        r_pr.append(color)
+        underline = OxmlElement("w:u")
+        underline.set(qn("w:val"), "single")
+        r_pr.append(underline)
+        new_run.append(r_pr)
+
+        text_element = OxmlElement("w:t")
+        text_element.text = text
+        new_run.append(text_element)
+        hyperlink.append(new_run)
+        paragraph._p.append(hyperlink)
+    except Exception:
+        paragraph.add_run(f"{text}: {url}")
+
+
+def _clean_quote_link(value) -> str:
+    link = str(value or "").strip()
+    if not link or link.lower() in {"nan", "none", "null"}:
+        return ""
+    return link
+
+
 def generate_digest_docx(payload: dict) -> bytes:
     try:
         from docx import Document
@@ -1584,6 +1624,12 @@ def generate_digest_docx(payload: dict) -> bytes:
                 meta = " · ".join([x for x in [quote.get("date"), quote.get("chat"), quote.get("author")] if x])
                 text = f"{meta}: {quote.get('text', '')}" if meta else quote.get("text", "")
                 doc.add_paragraph(text, style="List Bullet")
+                link = _clean_quote_link(quote.get("link"))
+                if link:
+                    link_paragraph = doc.add_paragraph()
+                    link_paragraph.paragraph_format.left_indent = Pt(18)
+                    link_paragraph.add_run("Ссылка на цитату: ")
+                    _add_docx_hyperlink(link_paragraph, link, "открыть сообщение")
         if idx != len(payload.get("topics", [])):
             doc.add_paragraph("---")
 
@@ -1682,6 +1728,10 @@ def generate_digest_pdf(payload: dict) -> bytes:
                 meta = " · ".join([x for x in [quote.get("date"), quote.get("chat"), quote.get("author")] if x])
                 text = f"{meta}: {quote.get('text', '')}" if meta else quote.get("text", "")
                 story.append(Paragraph("• " + xml_escape(text), small))
+                link = _clean_quote_link(quote.get("link"))
+                if link:
+                    safe_link = xml_escape(link, {"\"": "&quot;", "\047": "&apos;"})
+                    story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;Ссылка на цитату: <a href=\"{safe_link}\">открыть сообщение</a>", small))
         story.append(Spacer(1, 6))
 
     doc.build(story)
@@ -3170,7 +3220,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.6: добавлено массовое объединение нескольких инфоповодов")
+        st.caption("Версия 3.7: в выгрузку дайджеста добавлены ссылки на цитаты")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
