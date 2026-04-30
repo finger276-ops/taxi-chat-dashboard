@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import os
 import re
+from io import BytesIO
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -1278,6 +1279,471 @@ def render_dashboard_summary(events: pd.DataFrame, messages: pd.DataFrame, perio
             st.success("Ручное саммари очищено. Будет показана автоматическая версия.")
             st.rerun()
 
+
+
+# -----------------------------------------------------------------------------
+# Digest export: DOCX / PDF
+# -----------------------------------------------------------------------------
+
+
+def _visible_messages_for_digest(messages: pd.DataFrame) -> pd.DataFrame:
+    """Return messages that should be counted in the digest export."""
+    if not isinstance(messages, pd.DataFrame) or messages.empty:
+        return pd.DataFrame()
+    work = messages.copy()
+    if "message_hidden" in work.columns:
+        work = work[~work["message_hidden"].astype(bool)]
+    if "source_relevant" in work.columns:
+        rel = work["source_relevant"].astype(str).str.lower().str.strip()
+        work = work[~rel.isin(["false", "0", "no", "нет", "не релевантно", "нерелевантно"])]
+    return work
+
+
+def _visible_events_for_digest(events: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(events, pd.DataFrame) or events.empty:
+        return pd.DataFrame()
+    work = events.copy()
+    if "is_hidden" in work.columns:
+        work = work[~work["is_hidden"].astype(bool)]
+    return work
+
+
+def _sentiment_counts(messages: pd.DataFrame) -> dict[str, int]:
+    if not isinstance(messages, pd.DataFrame) or messages.empty:
+        return {"neutral": 0, "negative": 0, "positive": 0, "total": 0}
+    work = messages.copy()
+    total = int(len(work))
+
+    sentiment = work.get("sentiment", pd.Series([""] * len(work), index=work.index)).fillna("").astype(str).str.lower()
+    negative = sentiment.str.contains("нег|neg|отриц", regex=True, na=False)
+    positive = sentiment.str.contains("позит|pos|полож", regex=True, na=False)
+
+    if "is_negative" in work.columns:
+        negative = negative | work["is_negative"].astype(str).str.lower().isin(["true", "1", "yes", "да"])
+
+    # If a system exports explicit neutral values, anything not positive/negative is neutral.
+    neutral_count = max(0, total - int(negative.sum()) - int(positive.sum()))
+    return {
+        "neutral": int(neutral_count),
+        "negative": int(negative.sum()),
+        "positive": int(positive.sum()),
+        "total": total,
+    }
+
+
+def _pct_of(count: int, total: int, decimals: int = 0) -> str:
+    if not total:
+        return "0%"
+    value = count / total * 100
+    if decimals:
+        raw = f"{value:.{decimals}f}".replace(".", ",")
+        raw = re.sub(r",0$", "", raw)
+        return f"{raw}%"
+    return f"{value:.0f}%"
+
+
+def _clean_markdown_text(value: str) -> str:
+    text = str(value or "").strip()
+    text = text.replace("**", "")
+    text = re.sub(r"^\s*•\s*", "", text)
+    return text.strip()
+
+
+def _summary_body_for_digest(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str], conn) -> list[str]:
+    """Return bullet-like digest lines without the calculated first period line."""
+    key = _summary_key(period_ids)
+    auto_summary = build_auto_dashboard_summary(events, messages, period_ids)
+    saved = get_dashboard_summary(conn, key)
+    saved_text = str(saved.get("summary", "") or "").strip() if isinstance(saved, dict) else ""
+    summary_text = _sync_summary_first_line(saved_text, auto_summary) if saved_text else auto_summary
+    lines = []
+    for line in str(summary_text or "").splitlines():
+        cleaned = _clean_markdown_text(line)
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith("за период") or cleaned.lower().startswith("за выбранный период"):
+            continue
+        lines.append(cleaned)
+    if not lines:
+        lines.append("В периоде выделены основные темы, динамика обсуждений и наиболее заметные источники негатива.")
+    return lines
+
+
+def _quote_rows_for_digest(
+    topic_messages: pd.DataFrame,
+    *,
+    event_title: str,
+    event_summary: str,
+    tags: str,
+    pinned_message_ids: set[str],
+    limit: int,
+) -> pd.DataFrame:
+    if not isinstance(topic_messages, pd.DataFrame) or topic_messages.empty or limit <= 0:
+        return pd.DataFrame()
+    work = topic_messages.copy()
+    if "message_id" in work.columns:
+        work["message_id"] = work["message_id"].astype(str)
+    else:
+        work["message_id"] = ""
+
+    pinned = work[work["message_id"].isin({str(x) for x in pinned_message_ids})].copy()
+    if not pinned.empty and "datetime" in pinned.columns:
+        pinned = pinned.sort_values("datetime")
+    auto_limit = max(0, limit - len(pinned))
+    auto_source = work[~work["message_id"].isin(set(pinned.get("message_id", [])))].copy()
+    auto = rank_key_messages(
+        auto_source,
+        event_title=event_title,
+        event_summary=event_summary,
+        tags=tags,
+        limit=auto_limit,
+    ) if auto_limit else auto_source.iloc[0:0].copy()
+    result = pd.concat([pinned, auto], ignore_index=False) if not pinned.empty else auto
+    if result.empty:
+        return result
+    # Keep the digest readable and prevent repeated identical quotes.
+    result = result.copy()
+    result["_quote_key"] = result.get("text_clean", "").astype(str).apply(lambda x: _dedupe_key(x)[:120])
+    result = result.drop_duplicates("_quote_key")
+    return result.head(limit)
+
+
+def build_digest_export_payload(
+    events: pd.DataFrame,
+    messages: pd.DataFrame,
+    period_ids: list[str],
+    conn,
+    *,
+    max_topics: int = 8,
+    quotes_per_topic: int = 3,
+) -> dict:
+    """Build a plain data payload for DOCX/PDF digest export."""
+    visible_messages = _visible_messages_for_digest(messages)
+    visible_events = _visible_events_for_digest(events)
+    period_range = _summary_period_range(visible_messages, period_ids)
+    sentiment = _sentiment_counts(visible_messages)
+    total_messages = int(sentiment["total"])
+
+    pinned_df = get_key_message_pins(conn)
+    if isinstance(pinned_df, pd.DataFrame) and not pinned_df.empty:
+        pinned_df = pinned_df.copy()
+        pinned_df["event_id"] = pinned_df.get("event_id", "").astype(str)
+        pinned_df["message_id"] = pinned_df.get("message_id", "").astype(str)
+    else:
+        pinned_df = pd.DataFrame(columns=["event_id", "message_id"])
+
+    summary_lines = _summary_body_for_digest(visible_events, visible_messages, period_ids, conn)
+
+    topics: list[dict] = []
+    if not visible_events.empty and "event_title" in visible_events.columns:
+        work_events = visible_events.copy()
+        work_events["event_title"] = work_events["event_title"].fillna("").astype(str).str.strip()
+        work_events = work_events[work_events["event_title"] != ""]
+        if "message_count" not in work_events.columns:
+            work_events["message_count"] = 0
+        work_events["message_count"] = pd.to_numeric(work_events["message_count"], errors="coerce").fillna(0).astype(int)
+
+        grouped_rows = []
+        for title, group in work_events.groupby("event_title", sort=False):
+            event_ids = set(group.get("event_id", pd.Series(dtype=str)).astype(str).tolist())
+            if "final_event_id" in visible_messages.columns:
+                topic_messages = visible_messages[visible_messages["final_event_id"].astype(str).isin(event_ids)].copy()
+            else:
+                topic_messages = pd.DataFrame()
+            msg_count = int(len(topic_messages)) if not topic_messages.empty else int(group["message_count"].sum())
+            grouped_rows.append((title, group, event_ids, topic_messages, msg_count))
+
+        grouped_rows = sorted(grouped_rows, key=lambda x: x[4], reverse=True)[:max_topics]
+
+        for title, group, event_ids, topic_messages, msg_count in grouped_rows:
+            if msg_count <= 0:
+                continue
+            topic_sentiment = _sentiment_counts(topic_messages) if not topic_messages.empty else {"neutral": 0, "negative": int(group.get("negative_count", pd.Series([0])).sum()), "positive": 0, "total": msg_count}
+            # If only event-level negative is available, neutral is the rest.
+            if topic_sentiment["total"] == 0:
+                topic_sentiment["total"] = msg_count
+            if topic_sentiment["neutral"] == 0 and topic_sentiment["positive"] == 0 and topic_sentiment["negative"] <= msg_count:
+                topic_sentiment["neutral"] = max(0, msg_count - topic_sentiment["negative"])
+
+            summaries = [str(x).strip() for x in group.get("event_summary", pd.Series(dtype=str)).fillna("").astype(str).tolist() if str(x).strip()]
+            event_summary = summaries[0] if summaries else ""
+            main_tags = "|".join(sorted(set(_split_pipe_values(group.get("main_tags", pd.Series(dtype=str)))))) if "main_tags" in group.columns else ""
+            if not event_summary and not topic_messages.empty:
+                event_summary = build_event_description(title, main_tags, topic_messages)
+
+            pinned_message_ids = set(pinned_df.loc[pinned_df["event_id"].isin(event_ids), "message_id"].tolist())
+            quote_rows = _quote_rows_for_digest(
+                topic_messages,
+                event_title=title,
+                event_summary=event_summary,
+                tags=main_tags,
+                pinned_message_ids=pinned_message_ids,
+                limit=quotes_per_topic,
+            )
+            quotes = []
+            for _, row in quote_rows.iterrows():
+                text = str(row.get("text_clean", "") or "").strip()
+                if not text:
+                    continue
+                quotes.append({
+                    "date": format_date(row.get("datetime")),
+                    "chat": str(row.get("chat_title", "") or "").strip(),
+                    "author": str(row.get("author", "") or "").strip(),
+                    "text": re.sub(r"\s+", " ", text)[:900],
+                    "link": str(row.get("message_link", "") or "").strip(),
+                })
+
+            topics.append({
+                "title": title,
+                "message_count": msg_count,
+                "share": msg_count / total_messages if total_messages else 0.0,
+                "sentiment": topic_sentiment,
+                "summary": event_summary or "В теме обсуждались основные сообщения и реакции участников по выбранному инфоповоду.",
+                "quotes": quotes,
+            })
+
+    return {
+        "title": "Дайджест водительских чатов",
+        "period_range": period_range,
+        "message_count": total_messages,
+        "sentiment": sentiment,
+        "summary_lines": summary_lines,
+        "topics": topics,
+        "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    }
+
+
+def _digest_filename(period_range: str, suffix: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-zА-Яа-я_.-]+", "_", str(period_range or "period"), flags=re.UNICODE).strip("_")
+    safe = safe or "period"
+    return f"digest_driver_chats_{safe}.{suffix}"
+
+
+def _add_docx_bold_label(paragraph, label: str, text: str = ""):
+    run = paragraph.add_run(label)
+    run.bold = True
+    if text:
+        paragraph.add_run(text)
+
+
+def generate_digest_docx(payload: dict) -> bytes:
+    try:
+        from docx import Document
+        from docx.shared import Pt
+    except Exception as exc:
+        raise RuntimeError("Для выгрузки Word установите зависимость python-docx.") from exc
+
+    doc = Document()
+    styles = doc.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(10.5)
+
+    title = f"{payload['title']} | {payload['period_range']}"
+    p = doc.add_paragraph()
+    r = p.add_run(title)
+    r.bold = True
+    r.font.size = Pt(16)
+
+    sentiment = payload["sentiment"]
+    total = max(1, int(sentiment.get("total", 0)))
+    doc.add_paragraph(f"Релевантных сообщений: {payload['message_count']:,}".replace(",", " "))
+    doc.add_paragraph(
+        "Тональность: "
+        f"{_pct_of(sentiment.get('neutral', 0), total)} - нейтрал, "
+        f"{_pct_of(sentiment.get('negative', 0), total)} - негатив, "
+        f"{_pct_of(sentiment.get('positive', 0), total)} - позитив"
+    )
+    doc.add_paragraph("---")
+
+    p = doc.add_paragraph()
+    p.add_run("Главное за неделю").bold = True
+    for line in payload.get("summary_lines", []):
+        doc.add_paragraph(_clean_markdown_text(line), style=None).style = doc.styles["Normal"]
+    doc.add_paragraph("---")
+
+    p = doc.add_paragraph()
+    p.add_run("Обсуждения недели").bold = True
+
+    for idx, topic in enumerate(payload.get("topics", []), start=1):
+        sent = topic["sentiment"]
+        topic_total = max(1, int(sent.get("total", topic.get("message_count", 0))))
+        header = (
+            f"{topic['title']} — {_pct_of(topic.get('share', 0), 1, decimals=1)} сообщений | "
+            f"Тональность: {_pct_of(sent.get('neutral', 0), topic_total)} нейтрал, "
+            f"{_pct_of(sent.get('negative', 0), topic_total)} негатив, "
+            f"{_pct_of(sent.get('positive', 0), topic_total)} позитив"
+        )
+        p = doc.add_paragraph()
+        p.add_run(header).bold = True
+        doc.add_paragraph(_clean_markdown_text(topic.get("summary", "")))
+        quotes = topic.get("quotes", [])
+        if quotes:
+            qh = doc.add_paragraph()
+            qh.add_run("Ключевые цитаты:").bold = True
+            for quote in quotes:
+                meta = " · ".join([x for x in [quote.get("date"), quote.get("chat"), quote.get("author")] if x])
+                text = f"{meta}: {quote.get('text', '')}" if meta else quote.get("text", "")
+                doc.add_paragraph(text, style="List Bullet")
+        if idx != len(payload.get("topics", [])):
+            doc.add_paragraph("---")
+
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def _register_pdf_font():
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception as exc:
+        raise RuntimeError("Для выгрузки PDF установите зависимость reportlab.") from exc
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            try:
+                pdfmetrics.registerFont(TTFont("DigestSans", path))
+                return "DigestSans"
+            except Exception:
+                continue
+    # Fallback may not render Cyrillic in all environments, but keeps generation from crashing.
+    return "Helvetica"
+
+
+def generate_digest_pdf(payload: dict) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.lib.enums import TA_LEFT
+        from xml.sax.saxutils import escape as xml_escape
+    except Exception as exc:
+        raise RuntimeError("Для выгрузки PDF установите зависимость reportlab.") from exc
+
+    font_name = _register_pdf_font()
+    out = BytesIO()
+    doc = SimpleDocTemplate(
+        out,
+        pagesize=A4,
+        leftMargin=1.7 * cm,
+        rightMargin=1.7 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm,
+        title=f"{payload['title']} | {payload['period_range']}",
+    )
+    base = getSampleStyleSheet()
+    normal = ParagraphStyle("DigestNormal", parent=base["Normal"], fontName=font_name, fontSize=9.8, leading=13, alignment=TA_LEFT)
+    title_style = ParagraphStyle("DigestTitle", parent=normal, fontName=font_name, fontSize=16, leading=20, spaceAfter=10)
+    h_style = ParagraphStyle("DigestHeading", parent=normal, fontName=font_name, fontSize=12.5, leading=16, spaceBefore=8, spaceAfter=6)
+    topic_style = ParagraphStyle("DigestTopic", parent=normal, fontName=font_name, fontSize=10.5, leading=14, spaceBefore=8, spaceAfter=4)
+    small = ParagraphStyle("DigestSmall", parent=normal, fontName=font_name, fontSize=8.8, leading=12, leftIndent=12)
+
+    story = []
+    story.append(Paragraph(f"<b>{xml_escape(payload['title'])} | {xml_escape(payload['period_range'])}</b>", title_style))
+    sentiment = payload["sentiment"]
+    total = max(1, int(sentiment.get("total", 0)))
+    story.append(Paragraph(xml_escape(f"Релевантных сообщений: {payload['message_count']:,}".replace(",", " ")), normal))
+    tonality = (
+        "Тональность: "
+        f"{_pct_of(sentiment.get('neutral', 0), total)} - нейтрал, "
+        f"{_pct_of(sentiment.get('negative', 0), total)} - негатив, "
+        f"{_pct_of(sentiment.get('positive', 0), total)} - позитив"
+    )
+    story.append(Paragraph(xml_escape(tonality), normal))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>Главное за неделю</b>", h_style))
+    for line in payload.get("summary_lines", []):
+        story.append(Paragraph("• " + xml_escape(_clean_markdown_text(line)), normal))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>Обсуждения недели</b>", h_style))
+
+    for topic in payload.get("topics", []):
+        sent = topic["sentiment"]
+        topic_total = max(1, int(sent.get("total", topic.get("message_count", 0))))
+        header = (
+            f"{topic['title']} — {_pct_of(topic.get('share', 0), 1, decimals=1)} сообщений | "
+            f"Тональность: {_pct_of(sent.get('neutral', 0), topic_total)} нейтрал, "
+            f"{_pct_of(sent.get('negative', 0), topic_total)} негатив, "
+            f"{_pct_of(sent.get('positive', 0), topic_total)} позитив"
+        )
+        story.append(Paragraph(f"<b>{xml_escape(header)}</b>", topic_style))
+        story.append(Paragraph(xml_escape(_clean_markdown_text(topic.get("summary", ""))), normal))
+        quotes = topic.get("quotes", [])
+        if quotes:
+            story.append(Paragraph("<b>Ключевые цитаты:</b>", small))
+            for quote in quotes:
+                meta = " · ".join([x for x in [quote.get("date"), quote.get("chat"), quote.get("author")] if x])
+                text = f"{meta}: {quote.get('text', '')}" if meta else quote.get("text", "")
+                story.append(Paragraph("• " + xml_escape(text), small))
+        story.append(Spacer(1, 6))
+
+    doc.build(story)
+    return out.getvalue()
+
+
+def render_digest_export(events: pd.DataFrame, messages: pd.DataFrame, period_ids: list[str], conn) -> None:
+    """Render export controls for the current period selection."""
+    with st.expander("Выгрузка дайджеста", expanded=False):
+        st.caption("Сформируйте Word или PDF по выбранному периоду/периодам. В выгрузку попадают саммари, тональность, основные обсуждения и ключевые цитаты.")
+        col1, col2 = st.columns(2)
+        max_topics = int(col1.number_input("Тем в выгрузке", min_value=1, max_value=30, value=10, step=1))
+        quotes_per_topic = int(col2.number_input("Цитат на тему", min_value=0, max_value=10, value=3, step=1))
+
+        try:
+            payload = build_digest_export_payload(
+                events,
+                messages,
+                period_ids,
+                conn,
+                max_topics=max_topics,
+                quotes_per_topic=quotes_per_topic,
+            )
+        except Exception as exc:
+            st.error("Не удалось подготовить данные для выгрузки.")
+            st.exception(exc)
+            return
+
+        if not payload.get("message_count"):
+            st.info("Нет сообщений для выгрузки по выбранному периоду.")
+            return
+
+        st.write(
+            f"Будет выгружено: {payload['message_count']:,} сообщений, "
+            f"{len(payload.get('topics', []))} тем, период {payload.get('period_range', '')}.".replace(",", " ")
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            try:
+                docx_bytes = generate_digest_docx(payload)
+                st.download_button(
+                    "Скачать Word",
+                    data=docx_bytes,
+                    file_name=_digest_filename(payload.get("period_range", "period"), "docx"),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.warning(f"Word-выгрузка недоступна: {exc}")
+        with c2:
+            try:
+                pdf_bytes = generate_digest_pdf(payload)
+                st.download_button(
+                    "Скачать PDF",
+                    data=pdf_bytes,
+                    file_name=_digest_filename(payload.get("period_range", "period"), "pdf"),
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.warning(f"PDF-выгрузка недоступна: {exc}")
 
 
 def _safe_int_delta(value) -> str:
@@ -2624,7 +3090,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.4: обновлена лента сообщений и добавлено назначение темы/инфоповода")
+        st.caption("Версия 3.5: добавлена выгрузка дайджеста в Word и PDF")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
@@ -2685,6 +3151,7 @@ def main():
         render_period_comparison(enriched_messages, selected_period_ids)
 
     render_dashboard_summary(events, enriched_messages, selected_period_ids, conn, can_edit)
+    render_digest_export(events, enriched_messages, selected_period_ids, conn)
 
     filtered_events, word_query, word_matches = apply_filters(events, enriched_messages)
     filtered_messages = messages_for_events(enriched_messages, filtered_events)
