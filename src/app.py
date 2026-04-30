@@ -627,6 +627,12 @@ def apply_manual_edits(
             "main_tags": "|".join(all_tags),
             "source_main_topics": "; ".join(all_source_main_topics),
             "source_topics": "; ".join(all_source_topics),
+            "microtopic": "; ".join(sorted(set(
+                t.strip()
+                for topics in group.get("microtopic", pd.Series(dtype=str)).fillna("")
+                for t in re.split(r"[;|]", str(topics))
+                if t.strip()
+            ))),
             "keywords": "|".join(keywords),
             "key_phrases": "|".join(phrases),
             "start_date": start_date,
@@ -677,6 +683,439 @@ def apply_manual_edits(
         visible_events = visible_events.sort_values(["importance_score", "message_count"], ascending=False)
 
     return visible_events, enriched_messages
+
+
+# -----------------------------------------------------------------------------
+# Macro-events: semantic consolidation layer above generated information events
+# -----------------------------------------------------------------------------
+
+
+CONSOLIDATION_LEVELS = {
+    "balanced": "Сбалансировано",
+    "large": "Крупные темы",
+    "detailed": "Подробно",
+}
+
+
+def _normalize_macro_value(value: str) -> str:
+    """Normalize text for stable macro-event grouping keys."""
+    value = str(value or "").strip().lower().replace("ё", "е")
+    value = re.sub(r"https?://\S+|t\.me/\S+", " ", value)
+    value = re.sub(r"[^0-9a-zа-я\s_-]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" _-")
+    return value
+
+
+def _first_split_value(value: str, separators: str = r"[;|,]") -> str:
+    for item in re.split(separators, str(value or "")):
+        item = re.sub(r"\s+", " ", item).strip()
+        if item and item.lower() not in {"nan", "none", "nat", "<na>"}:
+            return item
+    return ""
+
+
+def _split_unique_values(value: str, separators: str = r"[;|,]") -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in re.split(separators, str(value or "")):
+        item = re.sub(r"\s+", " ", item).strip()
+        if not item or item.lower() in {"nan", "none", "nat", "<na>"}:
+            continue
+        key = item.lower().replace("ё", "е")
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _pipe_unique(values: list[str]) -> str:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for item in _split_unique_values(raw, separators=r"[|;,]"):
+            key = item.lower().replace("ё", "е")
+            if key not in seen:
+                seen.add(key)
+                result.append(item)
+    return "|".join(result)
+
+
+def _semi_unique(values: list[str]) -> str:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for item in _split_unique_values(raw, separators=r"[;|,]"):
+            key = item.lower().replace("ё", "е")
+            if key not in seen:
+                seen.add(key)
+                result.append(item)
+    return "; ".join(result)
+
+
+def _majority_value(values: list[str], fallback: str = "") -> str:
+    counter: Counter[str] = Counter()
+    original: dict[str, str] = {}
+    for raw in values:
+        value = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not value or value.lower() in {"nan", "none", "nat", "<na>"}:
+            continue
+        key = value.lower().replace("ё", "е")
+        counter[key] += 1
+        original.setdefault(key, value)
+    if not counter:
+        return fallback
+    key = counter.most_common(1)[0][0]
+    return original.get(key, fallback)
+
+
+def _expanded_source_event_ids(row: pd.Series) -> set[str]:
+    """Return all underlying source ids behind an event or macro-event row."""
+    ids: set[str] = set()
+    for col in ["source_event_ids", "macro_source_event_ids"]:
+        raw = str(row.get(col, "") or "")
+        for item in raw.split("|"):
+            item = item.strip()
+            if item:
+                ids.add(item)
+    event_id = str(row.get("event_id", "") or "").strip()
+    if event_id and not event_id.startswith("macro_"):
+        ids.add(event_id)
+    primary = str(row.get("primary_source_event_id", "") or "").strip()
+    if primary:
+        ids.add(primary)
+    return ids
+
+
+def _event_consolidation_key(row: pd.Series, level: str) -> str:
+    """Build a stable semantic bucket key for macro-event grouping.
+
+    The key intentionally prefers human/source topic markup when present, then
+    falls back to the internal microtopic and normalized title. This keeps the
+    existing fine-grained clustering as a source of evidence while showing a
+    cleaner layer in the dashboard.
+    """
+    event_id = str(row.get("event_id", "") or "").strip()
+    if str(row.get("is_manual", "")).lower() in {"true", "1", "yes", "да"}:
+        return f"manual:{event_id}"
+
+    if level == "detailed":
+        return f"event:{event_id}"
+
+    title_key = normalize_title_for_auto_merge(str(row.get("event_title", "") or ""))
+    title_key = _normalize_macro_value(title_key)
+    main_tag = _first_split_value(str(row.get("main_tags", "") or row.get("main_tag", "")), separators=r"[|;,]")
+    main_tag_key = _normalize_macro_value(main_tag)
+    microtopic = _normalize_macro_value(str(row.get("microtopic", "") or ""))
+    source_topic = _first_split_value(
+        str(row.get("source_main_topics", "") or row.get("source_main_topic", "") or row.get("source_topics", "")),
+        separators=r"[;|]",
+    )
+    source_topic_key = _normalize_macro_value(source_topic)
+
+    if level == "large":
+        if source_topic_key:
+            return f"large:source:{source_topic_key}"
+        if microtopic and microtopic != "other":
+            return f"large:micro:{microtopic}"
+        if main_tag_key and main_tag_key not in {"без тега", "яндекс"}:
+            return f"large:tag:{main_tag_key}"
+        return f"large:title:{title_key or event_id}"
+
+    # balanced: merge repeated waves of the same source/microtopic or stable title.
+    start_dt = pd.to_datetime(row.get("start_date", None), errors="coerce")
+    day_key = start_dt.strftime("%Y-%m-%d") if not pd.isna(start_dt) else "no_date"
+
+    if source_topic_key:
+        detail_key = microtopic or main_tag_key or title_key
+        return f"balanced:source:{source_topic_key}:{detail_key}:day:{day_key}"
+    if microtopic and microtopic != "other":
+        return f"balanced:micro:{microtopic}:{title_key or main_tag_key}:day:{day_key}"
+    return f"balanced:title:{main_tag_key}:{title_key or event_id}:day:{day_key}"
+
+
+def _macro_event_id(key: str, source_event_ids: set[str], level: str) -> str:
+    raw = f"{level}|{key}|{'|'.join(sorted(source_event_ids))}"
+    digest = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"macro_{digest}"
+
+
+def _primary_source_event_id(group: pd.DataFrame) -> str:
+    if group is None or group.empty:
+        return ""
+    work = group.copy()
+    if "message_count" not in work.columns:
+        work["message_count"] = 0
+    if "importance_score" not in work.columns:
+        work["importance_score"] = 0
+    ordered = work.sort_values(["message_count", "importance_score"], ascending=False)
+    for _, row in ordered.iterrows():
+        candidate = str(row.get("primary_source_event_id", "") or row.get("event_id", "") or "").strip()
+        if candidate and not candidate.startswith("macro_"):
+            return candidate
+        ids = _expanded_source_event_ids(row)
+        if ids:
+            return sorted(ids)[0]
+    return ""
+
+
+def _status_for_macro(group: pd.DataFrame) -> str:
+    statuses = [str(x).strip() for x in group.get("status", pd.Series(dtype=str)).fillna("").tolist() if str(x).strip()]
+    if not statuses:
+        return "новый"
+    for preferred in ["важное", "в работе", "новый", "решено", "шум"]:
+        if preferred in statuses:
+            return preferred
+    return statuses[0]
+
+
+def apply_event_overrides_to_visible_events(events: pd.DataFrame, overrides: pd.DataFrame | None) -> pd.DataFrame:
+    """Apply manual title/summary/status overrides to generated or macro events."""
+    if events is None or events.empty or overrides is None or overrides.empty or "event_id" not in events.columns:
+        return events
+
+    result = events.copy()
+    ov = overrides.copy()
+    if "event_id" not in ov.columns:
+        return result
+    ov = ov.set_index(ov["event_id"].astype(str), drop=False)
+
+    for idx, row in result.iterrows():
+        event_id = str(row.get("event_id", ""))
+        if event_id not in ov.index:
+            continue
+        override = ov.loc[event_id]
+        if isinstance(override, pd.DataFrame):
+            override = override.iloc[-1]
+        if str(override.get("title", "") or "").strip():
+            result.at[idx, "event_title"] = str(override.get("title")).strip()
+        if str(override.get("summary", "") or "").strip():
+            result.at[idx, "event_summary"] = str(override.get("summary")).strip()
+        if str(override.get("status", "") or "").strip():
+            result.at[idx, "status"] = str(override.get("status")).strip()
+        if str(override.get("priority", "") or "").strip():
+            result.at[idx, "priority"] = str(override.get("priority")).strip()
+        if "hidden" in override.index:
+            result.at[idx, "is_hidden"] = str(override.get("hidden", "0")).lower() in ["1", "true", "yes", "да"]
+    return result
+
+
+def build_consolidated_events(
+    events: pd.DataFrame,
+    messages: pd.DataFrame,
+    level: str = "balanced",
+    overrides: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build macro-events for dashboard/report display and remap messages to them.
+
+    level=detailed keeps the existing event layer.
+    level=balanced groups repeated waves inside the same source topic/microtopic.
+    level=large groups to broad agenda themes for executive digests.
+    """
+    if not isinstance(events, pd.DataFrame) or events.empty:
+        return events, messages
+
+    level = str(level or "balanced").strip().lower()
+    if level not in CONSOLIDATION_LEVELS:
+        level = "balanced"
+
+    display_messages = messages.copy() if isinstance(messages, pd.DataFrame) else pd.DataFrame()
+    if "final_event_id" in display_messages.columns and "source_final_event_id" not in display_messages.columns:
+        display_messages["source_final_event_id"] = display_messages["final_event_id"].astype(str)
+
+    base_events = events.copy()
+    if "source_event_ids" not in base_events.columns:
+        base_events["source_event_ids"] = base_events["event_id"].astype(str)
+    if "source_event_count" not in base_events.columns:
+        base_events["source_event_count"] = 1
+    if "primary_source_event_id" not in base_events.columns:
+        base_events["primary_source_event_id"] = base_events["event_id"].astype(str)
+    base_events["consolidation_key"] = base_events.apply(lambda row: _event_consolidation_key(row, level), axis=1)
+
+    if level == "detailed":
+        detailed = base_events.copy()
+        detailed["consolidation_level"] = "detailed"
+        detailed["macro_event_id"] = detailed["event_id"].astype(str)
+        detailed["primary_source_event_id"] = detailed["primary_source_event_id"].fillna("").astype(str)
+        if "final_event_id" in display_messages.columns:
+            display_messages["final_event_id"] = display_messages["source_final_event_id"].astype(str)
+            display_messages["macro_event_id"] = display_messages["final_event_id"]
+        return apply_event_overrides_to_visible_events(detailed, overrides), display_messages
+
+    rows: list[dict] = []
+    event_to_macro: dict[str, str] = {}
+
+    visible_message_base = display_messages.copy()
+    if "message_hidden" in visible_message_base.columns:
+        visible_message_base = visible_message_base[~visible_message_base["message_hidden"].astype(bool)]
+
+    for _, group in base_events.groupby("consolidation_key", sort=False):
+        group = group.copy()
+        event_ids_for_messages = set(group["event_id"].dropna().astype(str))
+        source_event_ids: set[str] = set()
+        for _, source_row in group.iterrows():
+            source_event_ids.update(_expanded_source_event_ids(source_row))
+        if not source_event_ids:
+            source_event_ids = event_ids_for_messages
+
+        macro_id = _macro_event_id(str(group["consolidation_key"].iloc[0]), source_event_ids, level)
+        for event_id in event_ids_for_messages:
+            event_to_macro[str(event_id)] = macro_id
+
+        if "source_final_event_id" in visible_message_base.columns:
+            group_messages = visible_message_base[visible_message_base["source_final_event_id"].astype(str).isin(event_ids_for_messages)].copy()
+        else:
+            group_messages = pd.DataFrame()
+
+        group_sorted = group.sort_values(["message_count", "importance_score"], ascending=False)
+        base = group_sorted.iloc[0]
+
+        source_topics = _semi_unique(
+            group.get("source_main_topics", pd.Series(dtype=str)).fillna("").astype(str).tolist()
+            + group.get("source_topics", pd.Series(dtype=str)).fillna("").astype(str).tolist()
+        )
+        microtopics = _semi_unique(group.get("microtopic", pd.Series(dtype=str)).fillna("").astype(str).tolist())
+        main_tags = _pipe_unique(
+            group.get("main_tags", pd.Series(dtype=str)).fillna("").astype(str).tolist()
+            + group.get("main_tag", pd.Series(dtype=str)).fillna("").astype(str).tolist()
+        )
+        keywords = _pipe_unique(group.get("keywords", pd.Series(dtype=str)).fillna("").astype(str).tolist())
+        phrases = _pipe_unique(group.get("key_phrases", pd.Series(dtype=str)).fillna("").astype(str).tolist())
+
+        if level == "large" and source_topics:
+            event_title = _first_split_value(source_topics, separators=r"[;|]")
+        else:
+            event_title = str(base.get("event_title", "") or "Укрупненный инфоповод").strip()
+
+        if not group_messages.empty and "datetime" in group_messages.columns:
+            start_date = pd.to_datetime(group_messages["datetime"], errors="coerce").min()
+            end_date = pd.to_datetime(group_messages["datetime"], errors="coerce").max()
+        else:
+            start_date = pd.to_datetime(group.get("start_date", pd.Series(dtype=str)), errors="coerce").min()
+            end_date = pd.to_datetime(group.get("end_date", pd.Series(dtype=str)), errors="coerce").max()
+
+        if not group_messages.empty:
+            msg_count = int(group_messages["message_id"].nunique()) if "message_id" in group_messages.columns else int(len(group_messages))
+            chat_count = int(group_messages["chat_id"].nunique()) if "chat_id" in group_messages.columns else int(group.get("chat_count", pd.Series(dtype=int)).sum())
+            author_count = int(group_messages["author_id"].nunique()) if "author_id" in group_messages.columns else int(group.get("author_count", pd.Series(dtype=int)).sum())
+            if "is_negative" in group_messages.columns:
+                negative_count = int(group_messages["is_negative"].astype(str).str.lower().isin(["true", "1", "yes", "да"]).sum())
+            elif "sentiment" in group_messages.columns:
+                negative_count = int(group_messages["sentiment"].astype(str).str.lower().str.contains("нег|neg", regex=True, na=False).sum())
+            else:
+                negative_count = int(group.get("negative_count", pd.Series(dtype=int)).sum())
+            toxic_count = int(group_messages["is_toxic"].astype(str).str.lower().isin(["true", "1", "yes", "да"]).sum()) if "is_toxic" in group_messages.columns else int(group.get("toxic_count", pd.Series(dtype=int)).sum())
+        else:
+            msg_count = int(pd.to_numeric(group.get("message_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+            chat_count = int(pd.to_numeric(group.get("chat_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+            author_count = int(pd.to_numeric(group.get("author_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+            negative_count = int(pd.to_numeric(group.get("negative_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+            toxic_count = int(pd.to_numeric(group.get("toxic_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
+
+        summary = build_event_description(
+            event_title,
+            main_tags,
+            group_messages,
+            keywords=keywords,
+            phrases=phrases,
+        )
+        if len(group) > 1:
+            summary = f"{summary} Укрупнено из {len(group)} первичных событий/волн."
+
+        primary_source_id = _primary_source_event_id(group)
+        rows.append({
+            "event_id": macro_id,
+            "macro_event_id": macro_id,
+            "primary_source_event_id": primary_source_id,
+            "source_event_ids": "|".join(sorted(source_event_ids)),
+            "macro_source_event_ids": "|".join(sorted(source_event_ids)),
+            "source_event_count": int(len(source_event_ids)),
+            "event_title": event_title,
+            "event_summary": summary,
+            "main_tag": _majority_value(group.get("main_tag", pd.Series(dtype=str)).fillna("").astype(str).tolist(), fallback=_first_split_value(main_tags, separators=r"[|]")),
+            "main_tags": main_tags,
+            "source_main_topics": source_topics,
+            "source_topics": source_topics,
+            "microtopic": microtopics,
+            "keywords": keywords,
+            "key_phrases": phrases,
+            "start_date": start_date,
+            "end_date": end_date,
+            "discussion_count": int(pd.to_numeric(group.get("discussion_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()),
+            "message_count": msg_count,
+            "chat_count": chat_count,
+            "author_count": author_count,
+            "negative_count": negative_count,
+            "toxic_count": toxic_count,
+            "negative_share": negative_count / msg_count if msg_count else 0.0,
+            "toxic_share": toxic_count / msg_count if msg_count else 0.0,
+            "importance_score": float(pd.to_numeric(group.get("importance_score", pd.Series(dtype=float)), errors="coerce").fillna(0).max()) + float(np.log1p(max(len(group) - 1, 0))),
+            "status": _status_for_macro(group),
+            "is_hidden": bool(group.get("is_hidden", pd.Series([False] * len(group))).astype(bool).all()),
+            "is_manual": False,
+            "consolidation_level": level,
+        })
+
+    macro_events = pd.DataFrame(rows)
+    if macro_events.empty:
+        return base_events, display_messages
+
+    if "final_event_id" in display_messages.columns:
+        display_messages["final_event_id"] = display_messages["source_final_event_id"].astype(str).map(event_to_macro).fillna(display_messages["source_final_event_id"].astype(str))
+        display_messages["macro_event_id"] = display_messages["final_event_id"]
+
+    macro_events = apply_event_overrides_to_visible_events(macro_events, overrides)
+    macro_events = macro_events.sort_values(["importance_score", "message_count"], ascending=False).reset_index(drop=True)
+    return macro_events, display_messages
+
+
+def render_consolidation_level_control(can_edit: bool = False) -> str:
+    """Sidebar control for macro-event detail level."""
+    labels = {
+        "balanced": "Сбалансировано — рекомендовано",
+        "large": "Крупные темы — для отчета",
+        "detailed": "Подробно — первичные инфоповоды",
+    }
+    selected = st.sidebar.selectbox(
+        "Уровень сборки инфоповодов",
+        options=["balanced", "large", "detailed"],
+        index=0,
+        format_func=lambda x: labels.get(x, x),
+        help=(
+            "Сбалансировано склеивает повторяющиеся волны внутри одной смысловой темы. "
+            "Крупные темы сильнее укрупняют повестку для управленческого дайджеста. "
+            "Подробно показывает первичные инфоповоды как раньше."
+        ),
+    )
+    if can_edit:
+        st.sidebar.caption("Новый слой не удаляет первичные события: он только укрупняет их для просмотра и выгрузки.")
+    return selected
+
+
+def render_consolidation_quality(raw_events: pd.DataFrame, visible_events: pd.DataFrame, messages: pd.DataFrame, level: str, can_edit: bool = False) -> None:
+    """Show compact quality metrics for the selected consolidation layer."""
+    if not can_edit or raw_events is None or visible_events is None or raw_events.empty:
+        return
+
+    raw_count = int(len(raw_events))
+    visible_count = int(len(visible_events))
+    hidden_count = int(visible_events.get("is_hidden", pd.Series(dtype=bool)).astype(bool).sum()) if "is_hidden" in visible_events.columns else 0
+    visible_non_hidden = max(0, visible_count - hidden_count)
+    msg_count = int(len(messages)) if isinstance(messages, pd.DataFrame) and not messages.empty else int(raw_events.get("message_count", pd.Series(dtype=int)).sum())
+    avg_raw = msg_count / raw_count if raw_count else 0
+    avg_visible = msg_count / visible_non_hidden if visible_non_hidden else 0
+
+    with st.sidebar.expander("Качество сборки", expanded=False):
+        st.write(f"Первичных инфоповодов: **{raw_count:,}**".replace(",", " "))
+        st.write(f"Показано на выбранном уровне: **{visible_non_hidden:,}**".replace(",", " "))
+        st.write(f"Среднее сообщений на первичный инфоповод: **{avg_raw:.1f}**")
+        st.write(f"Среднее сообщений на текущий инфоповод: **{avg_visible:.1f}**")
+        if level != "detailed":
+            reduction = (1 - visible_non_hidden / raw_count) * 100 if raw_count else 0
+            st.write(f"Укрупнение: **−{reduction:.0f}%** тем")
+        if "source_event_count" in visible_events.columns and level != "detailed":
+            candidates = visible_events[visible_events["source_event_count"].fillna(1).astype(int) > 1]
+            st.write(f"Укрупненных тем: **{len(candidates):,}**".replace(",", " "))
+
 
 
 def format_pct(value) -> str:
@@ -2030,6 +2469,7 @@ def event_table(events: pd.DataFrame) -> str | None:
     table["Название"] = table["event_title"]
     table["Описание"] = table["event_summary"]
     table["Сообщений"] = table["message_count"]
+    table["Первичных событий"] = table.get("source_event_count", pd.Series([1] * len(table))).fillna(1).astype(int)
     table["Чатов"] = table["chat_count"]
     table["Авторов"] = table["author_count"]
     table["Важность"] = table["importance_score"].round(1)
@@ -2045,6 +2485,7 @@ def event_table(events: pd.DataFrame) -> str | None:
         "Теги",
         "Период",
         "Сообщений",
+        "Первичных событий",
         "Чатов",
         "Негатив",
         "Важность",
@@ -2065,6 +2506,7 @@ def event_table(events: pd.DataFrame) -> str | None:
             "Теги": st.column_config.TextColumn(width="medium"),
             "Тема из файла": st.column_config.TextColumn(width="medium"),
             "Сообщений": st.column_config.NumberColumn(format="%d"),
+            "Первичных событий": st.column_config.NumberColumn(format="%d"),
             "Чатов": st.column_config.NumberColumn(format="%d"),
             "Важность": st.column_config.NumberColumn(format="%.1f"),
         },
@@ -2335,6 +2777,24 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
         return
 
     ev = selected.iloc[0]
+    event_source_ids = _expanded_source_event_ids(ev)
+    primary_event_id = str(ev.get("primary_source_event_id", "") or "").strip()
+    if not primary_event_id:
+        primary_event_id = sorted(event_source_ids)[0] if event_source_ids else str(event_id)
+    is_macro_event = str(event_id).startswith("macro_") or int(ev.get("source_event_count", 1) or 1) > 1
+
+    def primary_id_for_visible_event(visible_id: str) -> str:
+        match = events[events["event_id"].astype(str) == str(visible_id)]
+        if len(match):
+            row = match.iloc[0]
+            primary = str(row.get("primary_source_event_id", "") or "").strip()
+            if primary:
+                return primary
+            ids = _expanded_source_event_ids(row)
+            if ids:
+                return sorted(ids)[0]
+        return str(visible_id)
+
     event_messages = messages[
         (messages["final_event_id"] == event_id)
         & (~messages.get("message_hidden", pd.Series([False] * len(messages))).astype(bool))
@@ -2367,6 +2827,10 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
     if source_topics_caption:
         st.caption(f"Тема из файла: {source_topics_caption}")
     st.caption(f"Теги: {tags}")
+    if is_macro_event:
+        st.caption(
+            f"Укрупненный инфоповод: собрано первичных событий/волн — {int(ev.get('source_event_count', 1) or 1)}."
+        )
 
     tab_names = ["Ключевые сообщения", "Вся лента"] + (["Правки"] if can_edit else [])
     tabs = st.tabs(tab_names)
@@ -2518,17 +2982,19 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                             key=f"target_event_id_{event_id}_{message_id}",
                             disabled=not bool(target_ids),
                         )
+                        selected_target_primary_id = primary_id_for_visible_event(str(selected_target_id)) if selected_target_id else ""
+                        current_message_source_event_id = str(row.get("source_final_event_id", "") or event_id)
                         if selected_target_id:
                             st.caption(f"Будет назначен инфоповод: {target_label_map.get(str(selected_target_id), selected_target_id)}")
 
                         action_cols = st.columns(4)
                         if action_cols[0].button(
                             "Назначить инфоповод",
-                            disabled=not bool(selected_target_id) or str(selected_target_id) == str(event_id),
+                            disabled=not bool(selected_target_primary_id) or str(selected_target_primary_id) == current_message_source_event_id,
                             key=f"assign_event_{event_id}_{message_id}",
                         ):
                             try:
-                                move_message(conn, message_id, str(selected_target_id), note=msg_note)
+                                move_message(conn, message_id, str(selected_target_primary_id), note=msg_note)
                                 st.success("Сообщению назначен выбранный инфоповод.")
                                 st.cache_data.clear()
                                 st.rerun()
@@ -2536,7 +3002,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                                 st.error(str(e))
 
                         if action_cols[1].button("Нерелевант", key=f"irrelevant_{event_id}_{message_id}"):
-                            mark_message_irrelevant(conn, event_id, message_id, reason=msg_note)
+                            mark_message_irrelevant(conn, current_message_source_event_id, message_id, reason=msg_note)
                             st.success("Сообщение исключено из текущего инфоповода как нерелевантное.")
                             st.cache_data.clear()
                             st.rerun()
@@ -2612,7 +3078,11 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
 
             st.markdown("#### Нерелевантные сообщения")
             exclusions = get_message_exclusions(conn)
-            event_exclusions = exclusions[exclusions["event_id"] == event_id] if not exclusions.empty else exclusions
+            if not exclusions.empty:
+                exclusion_source_ids = {str(x) for x in event_source_ids} | {str(event_id)}
+                event_exclusions = exclusions[exclusions["event_id"].astype(str).isin(exclusion_source_ids)]
+            else:
+                event_exclusions = exclusions
             if event_exclusions.empty:
                 st.info("Для этого инфоповода пока нет сообщений, помеченных как нерелевантные.")
             else:
@@ -2643,8 +3113,9 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
                     if excluded_rows:
                         restored_row = excluded_messages.iloc[excluded_rows[0]]
                         st.write(restored_row.get("text_clean", ""))
+                        restore_event_id = str(event_exclusions[event_exclusions["message_id"].astype(str) == str(restored_row["message_id"])].iloc[0].get("event_id", event_id))
                         if st.button("Вернуть сообщение в инфоповод", key=f"restore_{event_id}_{restored_row['message_id']}"):
-                            restore_message_relevance(conn, event_id, restored_row["message_id"])
+                            restore_message_relevance(conn, restore_event_id, restored_row["message_id"])
                             st.success("Сообщение возвращено в инфоповод.")
                             st.cache_data.clear()
                             st.rerun()
@@ -2783,7 +3254,7 @@ def show_event_card(event_id: str, events: pd.DataFrame, messages: pd.DataFrame,
             reason = st.text_input("Причина объединения", value="", key=f"merge_reason_{event_id}")
             merge_disabled = not bool(selected_target_id) or len(internal_sources_to_merge) == 0
             if st.button("Объединить выбранные", disabled=merge_disabled, key=f"merge_button_{event_id}"):
-                target_id = str(selected_target_id)
+                target_id = primary_id_for_visible_event(str(selected_target_id))
                 try:
                     merged_count = 0
                     for source_id in sorted(internal_sources_to_merge):
@@ -3220,7 +3691,7 @@ def main():
 
     can_edit = render_admin_mode()
     if can_edit:
-        st.caption("Версия 3.7: в выгрузку дайджеста добавлены ссылки на цитаты")
+        st.caption("Версия 3.8: добавлен слой укрупнения инфоповодов")
     pages = ["Инфоповоды", "Поиск сообщений"] + (["Загрузка файла"] if can_edit else [])
     page = st.sidebar.radio("Раздел", pages, label_visibility="collapsed")
 
@@ -3266,6 +3737,22 @@ def main():
         msg_exclusions,
         manual_events,
         msg_topic_overrides,
+    )
+
+    events_before_consolidation = events.copy()
+    consolidation_level = render_consolidation_level_control(can_edit)
+    events, enriched_messages = build_consolidated_events(
+        events,
+        enriched_messages,
+        level=consolidation_level,
+        overrides=overrides,
+    )
+    render_consolidation_quality(
+        events_before_consolidation,
+        events,
+        enriched_messages,
+        consolidation_level,
+        can_edit,
     )
 
     if page == "Поиск сообщений":
